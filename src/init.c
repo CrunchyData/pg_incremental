@@ -31,4 +31,13 @@ _PG_init(void)
 							   PGC_USERSET,
 							   0,
 							   NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("incremental.log_statement",
+						   gettext_noop("Log all pipeline statements."),
+						   NULL,
+						   &IncrementalLogStatement,
+						   true,
+						   PGC_USERSET,
+						   0,
+						   NULL, NULL, NULL);
 }

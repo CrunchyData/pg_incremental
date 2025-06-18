@@ -8,6 +8,7 @@
 #include "catalog/pg_proc.h"
 #include "crunchy/incremental/file_list.h"
 #include "crunchy/incremental/pipeline.h"
+#include "crunchy/incremental/init.h"
 #include "executor/spi.h"
 #include "parser/parse_func.h"
 #include "storage/lmgr.h"
@@ -112,8 +113,11 @@ ExecuteFileListPipeline(char *pipelineName, char *command)
 
 	if (fileList->files == NIL)
 	{
-		ereport(NOTICE, (errmsg("pipeline %s: no files to process",
+		if (IncrementalLogStatement)
+		{
+			ereport(NOTICE, (errmsg("pipeline %s: no files to process",
 								pipelineName)));
+		}
 		return;
 	}
 
@@ -137,8 +141,11 @@ ExecuteFileListPipeline(char *pipelineName, char *command)
 		{
 			char	   *path = lfirst(fileCell);
 
-			ereport(NOTICE, (errmsg("pipeline %s: processing file list pipeline for %s",
+			if (IncrementalLogStatement)
+			{
+				ereport(NOTICE, (errmsg("pipeline %s: processing file list pipeline for %s",
 									pipelineName, path)));
+			}
 
 			ExecuteFileListPipelineForFile(pipelineName, command, path);
 			InsertProcessedFile(pipelineName, path);
@@ -214,9 +221,12 @@ ExecuteBatchedFileListPipeline(char *pipelineName, char *command, FileList * fil
 											 false,
 											 TYPALIGN_INT);
 
-	ereport(NOTICE, (errmsg("pipeline %s: processing file list pipeline for %d files",
+	if (IncrementalLogStatement)
+  {
+		ereport(NOTICE, (errmsg("pipeline %s: processing file list pipeline for %d files",
 							pipelineName,
 							fileCount)));
+  }
 
 	ExecuteFileListPipelineForFileArray(pipelineName, command, filesArray);
 

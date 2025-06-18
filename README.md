@@ -360,3 +360,8 @@ Arguments of the `incremental.drop_pipeline` function:
 | --------------------- | ----------- | ------------------------------------------------- | --------------------------- |
 | `pipeline_name`       | text        | User-defined name of the pipeline                 | Required                    |
 
+## Extension Settings
+
+| Setting                   | Default | Description                          |
+|--------------------------|---------|--------------------------------------|
+| incremental.log_statement | on      | Log all pipeline runs and activity. |

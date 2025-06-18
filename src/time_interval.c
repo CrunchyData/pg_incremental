@@ -7,6 +7,7 @@
 #include "catalog/pg_authid.h"
 #include "crunchy/incremental/pipeline.h"
 #include "crunchy/incremental/time_interval.h"
+#include "crunchy/incremental/init.h"
 #include "executor/spi.h"
 #include "storage/lmgr.h"
 #include "storage/lock.h"
@@ -107,8 +108,11 @@ ExecuteTimeIntervalPipeline(char *pipelineName, char *command)
 
 	if (range->rangeStart >= range->rangeEnd)
 	{
-		ereport(NOTICE, (errmsg("pipeline %s: no rows to process",
+		if (IncrementalLogStatement)
+		{
+			ereport(NOTICE, (errmsg("pipeline %s: no rows to process",
 								pipelineName)));
+		}
 		return;
 	}
 
@@ -127,8 +131,11 @@ ExecuteTimeIntervalPipeline(char *pipelineName, char *command)
 		char	   *rangeEndStr =
 			DatumGetCString(DirectFunctionCall1(timestamptz_out, rangeEndDatum));
 
-		ereport(NOTICE, (errmsg("pipeline %s: processing overall range from %s to %s",
+		if (IncrementalLogStatement)
+		{
+			ereport(NOTICE, (errmsg("pipeline %s: processing overall range from %s to %s",
 								pipelineName, rangeStartStr, rangeEndStr)));
+		}
 
 		TimestampTz nextStart = range->rangeStart;
 
