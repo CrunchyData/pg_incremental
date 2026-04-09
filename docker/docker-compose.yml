@@ -1,0 +1,47 @@
+# Run from repository root: ./docker/run-tests.sh
+# Manual build against the mount is not supported with :ro; use run-tests.sh.
+#
+# Services: postgres-17, postgres-18 (see PG_VERSIONS in docker/run-tests.sh).
+#
+# Example: PG_VERSIONS="17 18" ./docker/run-tests.sh
+
+x-postgres-common: &postgres-common
+  environment:
+    POSTGRES_HOST_AUTH_METHOD: trust
+  healthcheck:
+    test: ["CMD-SHELL", "pg_isready -U postgres"]
+    interval: 2s
+    timeout: 5s
+    retries: 30
+    start_period: 15s
+
+services:
+  postgres-17:
+    <<: *postgres-common
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      args:
+        PG_MAJOR: "17"
+        PG_IMAGE_SUFFIX: bookworm
+    volumes:
+      # PG ≤17 images use PGDATA under this path.
+      - pg_incremental_test_data_17:/var/lib/postgresql/data
+      - ..:/work:ro
+
+  postgres-18:
+    <<: *postgres-common
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      args:
+        PG_MAJOR: "18"
+        PG_IMAGE_SUFFIX: bookworm
+    volumes:
+      # PG 18 images expect a single mount at /var/lib/postgresql (versioned subdir inside).
+      - pg_incremental_test_data_18:/var/lib/postgresql
+      - ..:/work:ro
+
+volumes:
+  pg_incremental_test_data_17:
+  pg_incremental_test_data_18:

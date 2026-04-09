@@ -94,6 +94,72 @@ select count(*) from skip_log;
 -- all three paths (including skipped) appear in processed_files
 select count(*) from incremental.processed_files where pipeline_name = 'skip-test';
 
+-- max_batches_per_run: explicit -1 processes all pending files in one execute_pipeline
+insert into file_registry values
+    ('/unlim/x.csv'),
+    ('/unlim/y.csv');
+create table unlim_log (path text);
+select incremental.create_file_list_pipeline(
+    'unlimited-per-run',
+    '/unlim/%.csv',
+    $$ insert into file_list.unlim_log values ($1) $$,
+    list_function := 'file_list.list_local_files',
+    batched := false,
+    schedule := NULL,
+    execute_immediately := false,
+    max_batches_per_run := -1);
+call incremental.execute_pipeline('unlimited-per-run');
+select count(*) from unlim_log;
+
+-- max_batches_per_run: positive cap — one file per execute_pipeline when not batched
+insert into file_registry values
+    ('/cap/a.csv'),
+    ('/cap/b.csv'),
+    ('/cap/c.csv');
+create table cap_log (path text);
+select incremental.create_file_list_pipeline(
+    'cap-one-per-run',
+    '/cap/%.csv',
+    $$ insert into file_list.cap_log values ($1) $$,
+    list_function := 'file_list.list_local_files',
+    batched := false,
+    schedule := NULL,
+    execute_immediately := false,
+    max_batches_per_run := 1);
+call incremental.execute_pipeline('cap-one-per-run');
+select count(*) from cap_log;
+call incremental.execute_pipeline('cap-one-per-run');
+select count(*) from cap_log;
+call incremental.execute_pipeline('cap-one-per-run');
+select count(*) from cap_log;
+call incremental.execute_pipeline('cap-one-per-run');
+select count(*) from cap_log;
+
+-- max_batches_per_run: batched — one batch iteration per execute_pipeline (max_batch_size=2, five files)
+insert into file_registry values
+    ('/mcap/1.csv'),
+    ('/mcap/2.csv'),
+    ('/mcap/3.csv'),
+    ('/mcap/4.csv'),
+    ('/mcap/5.csv');
+create table mcap_log (path text);
+select incremental.create_file_list_pipeline(
+    'batched-cap-one-batch-per-run',
+    '/mcap/%.csv',
+    $$ insert into file_list.mcap_log select unnest($1) $$,
+    list_function := 'file_list.list_local_files',
+    batched := true,
+    max_batch_size := 2,
+    schedule := NULL,
+    execute_immediately := false,
+    max_batches_per_run := 1);
+call incremental.execute_pipeline('batched-cap-one-batch-per-run');
+select count(*) from mcap_log;
+call incremental.execute_pipeline('batched-cap-one-batch-per-run');
+select count(*) from mcap_log;
+call incremental.execute_pipeline('batched-cap-one-batch-per-run');
+select count(*) from mcap_log;
+
 -- reset_pipeline: clears processed_files so all files are reprocessed
 select incremental.reset_pipeline('ingest-files', execute_immediately := false);
 call incremental.execute_pipeline('ingest-files');

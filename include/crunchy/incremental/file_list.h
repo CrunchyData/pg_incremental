@@ -5,7 +5,8 @@
 
 extern char *DefaultFileListFunction;
 
-void		InitializeFileListPipelineState(char *pipelineName, char *prefix, bool batched, char *listFunction, int maxBatchSize);
+void		InitializeFileListPipelineState(char *pipelineName, char *prefix, bool batched, char *listFunction, int maxBatchSize,
+										  int maxBatchesPerRun);
 void		RemoveProcessedFileList(char *pipelineName);
 void		ExecuteFileListPipeline(char *pipelineName, char *command);
 bool		ListFunctionExists(char *listFunction);
