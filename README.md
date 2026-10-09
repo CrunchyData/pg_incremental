@@ -246,10 +246,6 @@ Arguments of the `incremental.create_time_range_pipeline` function:
 
 ### Creating a file list pipeline
 
-Upgrading from extension version **1.5** to **1.6** runs `pg_incremental--1.5--1.6.sql`: it adds **`shard_count`** to `incremental.file_list_pipelines` and `incremental.create_file_list_pipeline`, and adds an `incremental.execute_pipeline(pipeline_name, shard)` procedure. Use `ALTER EXTENSION pg_incremental UPDATE TO '1.6';`.
-
-Upgrading from extension version **1.4** to **1.5** runs `pg_incremental--1.4--1.5.sql`: it refreshes `_drop_extension_trigger` (including the `pg_cron` guard for `DROP EXTENSION`) and adds **`max_batches_per_run`** to `incremental.file_list_pipelines` and `incremental.create_file_list_pipeline`. Use `ALTER EXTENSION pg_incremental UPDATE TO '1.5';`.
-
 You can define a file list pipeline with the `incremental.create_file_list_pipeline` function by specifying a generic pipeline name, a file pattern, and a command. When the pipeline is not batched, the command runs with `$1` set to the path of a file (`text`). When batched, `$1` is a `text[]` of paths. Each call to `incremental.execute_pipeline` (or each pg\_cron run) lists unprocessed paths from your list function and runs the command up to **`max_batches_per_run`** times in that invocation: `-1` (default) means no limit—process every file (every batch when batched) in that run; a positive integer caps how many batch iterations run—each iteration is one file when not batched, or one array batch when batched. Remaining paths wait for the next run.
 
 Example:
