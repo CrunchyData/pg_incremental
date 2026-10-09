@@ -4,6 +4,7 @@
 #include "miscadmin.h"
 
 #include "catalog/dependency.h"
+#include "catalog/namespace.h"
 #include "catalog/pg_authid.h"
 #include "catalog/pg_proc.h"
 #include "crunchy/incremental/file_list.h"
@@ -318,11 +319,12 @@ GetUnprocessedFilesForPipeline(char *pipelineName, int shard)
 	SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, SECURITY_LOCAL_USERID_CHANGE);
 
 	/*
-	 * Get the file list pipeline properties.
+	 * Get the file list pipeline properties. The unsharded query does not
+	 * read shard_count, such that existing pipelines keep working when the
+	 * extension SQL has not been updated to 1.6 yet.
 	 */
 	char	   *query = shard == ALL_SHARDS ?
-		"select batched, list_function, file_pattern, max_batch_size, max_batches_per_run, "
-		"shard_count "
+		"select batched, list_function, file_pattern, max_batch_size, max_batches_per_run "
 		"from incremental.file_list_pipelines "
 		"where pipeline_name operator(pg_catalog.=) $1 "
 		"for update" :
@@ -377,8 +379,10 @@ GetUnprocessedFilesForPipeline(char *pipelineName, int shard)
 	if (!maxBatchesIsNull)
 		maxBatchesPerRun = DatumGetInt32(maxBatchesDatum);
 
-	Datum		shardCountDatum = SPI_getbinval(row, rowDesc, 6, &isNull);
-	int			shardCount = DatumGetInt32(shardCountDatum);
+	int			shardCount = 1;
+
+	if (shard != ALL_SHARDS)
+		shardCount = DatumGetInt32(SPI_getbinval(row, rowDesc, 6, &isNull));
 
 	MemoryContext oldContext = MemoryContextSwitchTo(outerContext);
 
@@ -701,6 +705,16 @@ SanitizeListFunction(char *listFunction)
 int
 GetFileListPipelineShardCount(char *pipelineName)
 {
+	/*
+	 * Before the 1.6 upgrade, there is no shard_count column and all
+	 * pipelines are unsharded.
+	 */
+	Oid			namespaceId = get_namespace_oid("incremental", false);
+	Oid			relationId = get_relname_relid("file_list_pipelines", namespaceId);
+
+	if (get_attnum(relationId, "shard_count") == InvalidAttrNumber)
+		return 1;
+
 	Oid			savedUserId = InvalidOid;
 	int			savedSecurityContext = 0;
 
