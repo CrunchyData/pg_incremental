@@ -247,49 +247,55 @@ select count(*) from mcap_log;
      5
 (1 row)
 
--- shard_count: a sharded pipeline whose shards each process a disjoint subset of files
-insert into file_registry select '/shard/' || i || '.csv' from generate_series(1, 20) i;
-create table shard_log (path text, shard int);
+-- job_count: a pipeline whose jobs each process a disjoint subset of files
+insert into file_registry select '/par/' || i || '.csv' from generate_series(1, 20) i;
+create table par_log (path text, job_index int);
+-- with multiple jobs, existing files are not processed immediately
 select incremental.create_file_list_pipeline(
-    'sharded',
-    '/shard/%.csv',
-    $$ insert into file_list.shard_log values ($1, current_setting('file_list.shard')::int) $$,
+    'parallel',
+    '/par/%.csv',
+    $$ insert into file_list.par_log values ($1, current_setting('file_list.job_index')::int) $$,
     list_function := 'file_list.list_local_files',
     schedule := NULL,
-    execute_immediately := false,
-    shard_count := 3);
+    job_count := 3);
  create_file_list_pipeline 
 ---------------------------
  
 (1 row)
 
-select shard_count from incremental.file_list_pipelines where pipeline_name = 'sharded';
- shard_count 
--------------
-           3
+select job_count from incremental.file_list_pipelines where pipeline_name = 'parallel';
+ job_count 
+-----------
+         3
 (1 row)
 
-set file_list.shard to 0;
-call incremental.execute_pipeline('sharded', 0);
-set file_list.shard to 1;
-call incremental.execute_pipeline('sharded', 1);
-set file_list.shard to 2;
-call incremental.execute_pipeline('sharded', 2);
--- every file is processed exactly once, by the shard its path hashes to
-select count(*), count(distinct path) from shard_log;
- count | count 
--------+-------
-    20 |    20
-(1 row)
-
-select count(*) from shard_log
-where shard <> abs(hashtextextended(path, 0) % 3);
+select count(*) from par_log;
  count 
 -------
      0
 (1 row)
 
-select count(*) > 0 from shard_log group by shard order by shard;
+set file_list.job_index to 0;
+call incremental.execute_pipeline('parallel', 0);
+set file_list.job_index to 1;
+call incremental.execute_pipeline('parallel', 1);
+set file_list.job_index to 2;
+call incremental.execute_pipeline('parallel', 2);
+-- every file is processed exactly once, by the job its path hashes to
+select count(*), count(distinct path) from par_log;
+ count | count 
+-------+-------
+    20 |    20
+(1 row)
+
+select count(*) from par_log
+where job_index <> abs(hashtextextended(path, 0) % 3);
+ count 
+-------
+     0
+(1 row)
+
+select count(*) > 0 from par_log group by job_index order by job_index;
  ?column? 
 ----------
  t
@@ -297,41 +303,41 @@ select count(*) > 0 from shard_log group by shard order by shard;
  t
 (3 rows)
 
--- re-running a shard does nothing
-call incremental.execute_pipeline('sharded', 0);
-select count(*) from shard_log;
+-- re-running a job does nothing
+call incremental.execute_pipeline('parallel', 0);
+select count(*) from par_log;
  count 
 -------
     20
 (1 row)
 
--- an unsharded execution processes new files of all shards
-insert into file_registry select '/shard/' || i || '.csv' from generate_series(21, 25) i;
-set file_list.shard to -1;
-call incremental.execute_pipeline('sharded');
-select count(*), count(distinct path) from shard_log;
+-- executing without a job index processes new files of all jobs
+insert into file_registry select '/par/' || i || '.csv' from generate_series(21, 25) i;
+set file_list.job_index to -1;
+call incremental.execute_pipeline('parallel');
+select count(*), count(distinct path) from par_log;
  count | count 
 -------+-------
     25 |    25
 (1 row)
 
-select count(*) from incremental.processed_files where pipeline_name = 'sharded';
+select count(*) from incremental.processed_files where pipeline_name = 'parallel';
  count 
 -------
     25
 (1 row)
 
--- shard must be in range, and only file list pipelines can be sharded
-call incremental.execute_pipeline('sharded', 3);
-ERROR:  shard 3 is out of range for pipeline "sharded"
-DETAIL:  The pipeline has 3 shards, numbered 0 to 2.
-call incremental.execute_pipeline('sharded', -1);
-ERROR:  shard cannot be negative
-call incremental.execute_pipeline('sharded', NULL);
-ERROR:  shard cannot be NULL
-create table shard_events (id bigserial, path text);
+-- job index must be in range, and only file list pipelines can have multiple jobs
+call incremental.execute_pipeline('parallel', 3);
+ERROR:  job index 3 is out of range for pipeline "parallel"
+DETAIL:  The pipeline has 3 jobs, numbered 0 to 2.
+call incremental.execute_pipeline('parallel', -1);
+ERROR:  job_index cannot be negative
+call incremental.execute_pipeline('parallel', NULL);
+ERROR:  job_index cannot be NULL
+create table par_events (id bigserial, path text);
 select incremental.create_sequence_pipeline(
-    'not-a-file-list', 'file_list.shard_events', $$ select $1, $2 $$, schedule := NULL);
+    'not-a-file-list', 'file_list.par_events', $$ select $1, $2 $$, schedule := NULL);
  create_sequence_pipeline 
 --------------------------
  
@@ -339,64 +345,126 @@ select incremental.create_sequence_pipeline(
 
 call incremental.execute_pipeline('not-a-file-list', 0);
 ERROR:  pipeline "not-a-file-list" is not a file list pipeline
-DETAIL:  Only file list pipelines can be executed by shard.
+DETAIL:  Only file list pipelines can have multiple jobs.
+select incremental.alter_file_list_pipeline('not-a-file-list', 2);
+ERROR:  pipeline "not-a-file-list" is not a file list pipeline
+DETAIL:  Only file list pipelines can have multiple jobs.
 select incremental.create_file_list_pipeline(
-    'zero-shards', '/shard/%.csv', $$ select $1 $$,
-    list_function := 'file_list.list_local_files', schedule := NULL, shard_count := 0);
-ERROR:  shard_count must be a positive integer
--- batched sharded pipeline with max_batch_size
-insert into file_registry select '/bshard/' || i || '.csv' from generate_series(1, 10) i;
-create table bshard_log (batch_size int);
-select incremental.create_file_list_pipeline(
-    'batched-sharded',
-    '/bshard/%.csv',
-    $$ insert into file_list.bshard_log values (cardinality($1)) $$,
-    list_function := 'file_list.list_local_files',
-    batched := true,
-    max_batch_size := 2,
-    schedule := NULL,
-    execute_immediately := false,
-    shard_count := 2);
- create_file_list_pipeline 
----------------------------
+    'zero-jobs', '/par/%.csv', $$ select $1 $$,
+    list_function := 'file_list.list_local_files', schedule := NULL, job_count := 0);
+ERROR:  job_count must be a positive integer
+-- alter_file_list_pipeline: change the number of jobs; files keep their processed state
+select incremental.alter_file_list_pipeline('parallel', 0);
+ERROR:  job_count must be a positive integer
+select incremental.alter_file_list_pipeline('parallel', 2);
+ alter_file_list_pipeline 
+--------------------------
  
 (1 row)
 
-call incremental.execute_pipeline('batched-sharded', 0);
-call incremental.execute_pipeline('batched-sharded', 1);
-select sum(batch_size), max(batch_size) <= 2 from bshard_log;
- sum | ?column? 
------+----------
-  10 | t
+select job_count from incremental.file_list_pipelines where pipeline_name = 'parallel';
+ job_count 
+-----------
+         2
 (1 row)
 
-select count(*) from incremental.processed_files where pipeline_name = 'batched-sharded';
- count 
--------
-    10
+call incremental.execute_pipeline('parallel', 2);
+ERROR:  job index 2 is out of range for pipeline "parallel"
+DETAIL:  The pipeline has 2 jobs, numbered 0 to 1.
+insert into file_registry select '/par/' || i || '.csv' from generate_series(26, 40) i;
+set file_list.job_index to 0;
+call incremental.execute_pipeline('parallel', 0);
+set file_list.job_index to 1;
+call incremental.execute_pipeline('parallel', 1);
+select count(*), count(distinct path) from par_log;
+ count | count 
+-------+-------
+    40 |    40
 (1 row)
 
--- reset clears the processed files of all shards
-select incremental.reset_pipeline('batched-sharded', execute_immediately := false);
- reset_pipeline 
-----------------
- 
-(1 row)
-
-select count(*) from incremental.processed_files where pipeline_name = 'batched-sharded';
+select count(*) from par_log
+where substring(path from '/par/([0-9]+)')::int >= 26 and job_index <> abs(hashtextextended(path, 0) % 2);
  count 
 -------
      0
 (1 row)
 
--- drop a sharded pipeline
-select incremental.drop_pipeline('batched-sharded');
+-- back to a single job
+select incremental.alter_file_list_pipeline('parallel', 1);
+ alter_file_list_pipeline 
+--------------------------
+ 
+(1 row)
+
+insert into file_registry values ('/par/41.csv');
+set file_list.job_index to 0;
+call incremental.execute_pipeline('parallel', 0);
+call incremental.execute_pipeline('parallel');
+select count(*), count(distinct path) from par_log;
+ count | count 
+-------+-------
+    41 |    41
+(1 row)
+
+-- batched pipeline with multiple jobs and max_batch_size
+insert into file_registry select '/bpar/' || i || '.csv' from generate_series(1, 10) i;
+create table bpar_log (batch_size int);
+select incremental.create_file_list_pipeline(
+    'batched-parallel',
+    '/bpar/%.csv',
+    $$ insert into file_list.bpar_log values (cardinality($1)) $$,
+    list_function := 'file_list.list_local_files',
+    batched := true,
+    max_batch_size := 2,
+    schedule := NULL,
+    execute_immediately := false,
+    job_count := 2);
+ create_file_list_pipeline 
+---------------------------
+ 
+(1 row)
+
+call incremental.execute_pipeline('batched-parallel', 0);
+call incremental.execute_pipeline('batched-parallel', 1);
+select sum(batch_size), max(batch_size) <= 2 from bpar_log;
+ sum | ?column? 
+-----+----------
+  10 | t
+(1 row)
+
+select count(*) from incremental.processed_files where pipeline_name = 'batched-parallel';
+ count 
+-------
+    10
+(1 row)
+
+-- reset clears the processed files of all jobs, and does not execute immediately
+select incremental.reset_pipeline('batched-parallel', execute_immediately := true);
+ reset_pipeline 
+----------------
+ 
+(1 row)
+
+select count(*) from incremental.processed_files where pipeline_name = 'batched-parallel';
+ count 
+-------
+     0
+(1 row)
+
+select sum(batch_size) from bpar_log;
+ sum 
+-----
+  10
+(1 row)
+
+-- drop a pipeline with multiple jobs
+select incremental.drop_pipeline('batched-parallel');
  drop_pipeline 
 ---------------
  
 (1 row)
 
-select count(*) from incremental.file_list_pipelines where pipeline_name = 'batched-sharded';
+select count(*) from incremental.file_list_pipelines where pipeline_name = 'batched-parallel';
  count 
 -------
      0

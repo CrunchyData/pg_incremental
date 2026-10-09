@@ -1,6 +1,8 @@
 ### pg\_incremental v1.6.0
 
-* Add `shard_count` to file list pipelines (`incremental.create_file_list_pipeline` and `incremental.file_list_pipelines`) to process files in parallel. Each file is assigned to a shard by a hash of its path, and `incremental.execute_pipeline(pipeline_name, shard)` processes only the files of one shard. Different shards can run concurrently, and with a schedule, a pg\_cron job is created for each shard.
+* Add `job_count` to file list pipelines (`incremental.create_file_list_pipeline` and `incremental.file_list_pipelines`) to process files in parallel. Each file is assigned to one of the jobs by a hash of its path, and `incremental.execute_pipeline(pipeline_name, job_index)` processes only the files of one job. Different jobs can run concurrently, and with a schedule, a pg\_cron job is created for each of them.
+* Add `incremental.alter_file_list_pipeline(pipeline_name, job_count)` to change the number of parallel jobs of a file list pipeline, for instance during a backfill.
+* With `job_count` greater than 1, `execute_immediately` in `create_file_list_pipeline` and `reset_pipeline` leaves existing files to the parallel jobs.
 * `incremental.drop_pipeline` no longer fails when pg\_cron is not installed.
 
 ### pg\_incremental v1.5.0

@@ -42,11 +42,11 @@ static void ExecuteBatchedFileListPipeline(char *pipelineName, char *command, Fi
 										   int offset);
 static void ExecuteFileListPipelineForFileArray(char *pipelineName, char *command,
 												ArrayType *filePaths);
-static FileList * GetUnprocessedFilesForPipeline(char *pipelineName, int shard);
+static FileList * GetUnprocessedFilesForPipeline(char *pipelineName, int jobIndex);
 static List *GetUnprocessedFileList(char *pipelineName, char *listFunction,
-									char *filePattern, int shardCount, int shard);
-static void LockFileListPipelineShard(char *pipelineName, int shard);
-static bool ShardCountColumnExists(void);
+									char *filePattern, int jobCount, int jobIndex);
+static void LockFileListPipelineJob(char *pipelineName, int jobIndex);
+static bool JobCountColumnExists(void);
 
 
 /* crunchy_lake.default_file_list_function setting */
@@ -60,7 +60,7 @@ char	   *DefaultFileListFunction = DEFAULT_FILE_LIST_FUNCTION;
 void
 InitializeFileListPipelineState(char *pipelineName, char *pattern, bool batched,
 								char *listFunction, int maxBatchSize,
-								int maxBatchesPerRun, int shardCount)
+								int maxBatchesPerRun, int jobCount)
 {
 	Oid			savedUserId = InvalidOid;
 	int			savedSecurityContext = 0;
@@ -73,19 +73,19 @@ InitializeFileListPipelineState(char *pipelineName, char *pattern, bool batched,
 	SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, SECURITY_LOCAL_USERID_CHANGE);
 
 	/*
-	 * Before the 1.6 upgrade, there is no shard_count column and only
-	 * unsharded pipelines can be created.
+	 * Before the 1.6 upgrade, there is no job_count column and only
+	 * single-job pipelines can be created.
 	 */
-	bool		hasShardCount = ShardCountColumnExists();
+	bool		hasJobCount = JobCountColumnExists();
 
-	if (!hasShardCount && shardCount != 1)
-		ereport(ERROR, (errmsg("extension needs to be updated to use shard_count"),
+	if (!hasJobCount && jobCount != 1)
+		ereport(ERROR, (errmsg("extension needs to be updated to use job_count"),
 						errhint("Run ALTER EXTENSION pg_incremental UPDATE")));
 
-	char	   *query = hasShardCount ?
+	char	   *query = hasJobCount ?
 		"insert into incremental.file_list_pipelines "
 		"(pipeline_name, file_pattern, batched, list_function, max_batch_size, max_batches_per_run, "
-		"shard_count) "
+		"job_count) "
 		"values ($1, $2, $3, $4, $5, $6, $7)" :
 		"insert into incremental.file_list_pipelines "
 		"(pipeline_name, file_pattern, batched, list_function, max_batch_size, max_batches_per_run) "
@@ -93,7 +93,7 @@ InitializeFileListPipelineState(char *pipelineName, char *pattern, bool batched,
 
 	bool		readOnly = false;
 	int			tupleCount = 0;
-	int			argCount = hasShardCount ? 7 : 6;
+	int			argCount = hasJobCount ? 7 : 6;
 	Oid			argTypes[] = {TEXTOID, TEXTOID, BOOLOID, TEXTOID, INT4OID, INT4OID, INT4OID};
 	Datum		argValues[] = {
 		CStringGetTextDatum(pipelineName),
@@ -102,7 +102,7 @@ InitializeFileListPipelineState(char *pipelineName, char *pattern, bool batched,
 		CStringGetTextDatum(listFunction),
 		Int32GetDatum(maxBatchSize),
 		Int32GetDatum(maxBatchesPerRun),
-		Int32GetDatum(shardCount)
+		Int32GetDatum(jobCount)
 	};
 	char		argNulls[] = {
 		' ', ' ', ' ', ' ', maxBatchSize > 0 ? ' ' : 'n', ' ', ' '
@@ -123,16 +123,16 @@ InitializeFileListPipelineState(char *pipelineName, char *pattern, bool batched,
 
 
 /*
- * ExecuteFileListPipeline executes a file list pipeline. If shard is
- * ALL_SHARDS, all unprocessed files are considered. Otherwise, only the
- * unprocessed files that hash to the given shard are considered, and
- * other shards of the same pipeline can be executed concurrently.
+ * ExecuteFileListPipeline executes a file list pipeline. If jobIndex is
+ * ALL_JOBS, all unprocessed files are considered. Otherwise, only the
+ * unprocessed files that hash to the given job index are considered, and
+ * other jobs of the same pipeline can be executed concurrently.
  */
 void
-ExecuteFileListPipeline(char *pipelineName, char *command, int shard)
+ExecuteFileListPipeline(char *pipelineName, char *command, int jobIndex)
 {
 	/* get the full fileList of data to process */
-	FileList   *fileList = GetUnprocessedFilesForPipeline(pipelineName, shard);
+	FileList   *fileList = GetUnprocessedFilesForPipeline(pipelineName, jobIndex);
 
 	if (fileList->files == NIL)
 	{
@@ -307,18 +307,18 @@ ExecuteFileListPipelineForFileArray(char *pipelineName, char *command, ArrayType
 
 /*
  * GetUnprocessedFilesForPipeline returns the list of files that are not
- * yet processed, optionally restricted to a single shard.
+ * yet processed, optionally restricted to the files of a single job.
  *
- * An unsharded execution locks the pipeline row exclusively, which
- * serializes it with all other executions of the pipeline. A sharded
- * execution only takes a share lock on the pipeline row, such that
- * different shards can run concurrently, and an advisory lock on the
- * shard, such that executions of the same shard are serialized. Shards
- * process disjoint sets of files, so they never insert the same path into
+ * An execution of all jobs locks the pipeline row exclusively, which
+ * serializes it with all other executions of the pipeline. An execution
+ * of a single job only takes a share lock on the pipeline row, such that
+ * different jobs can run concurrently, and an advisory lock on the job,
+ * such that executions of the same job are serialized. Jobs process
+ * disjoint sets of files, so they never insert the same path into
  * processed_files.
  */
 static FileList *
-GetUnprocessedFilesForPipeline(char *pipelineName, int shard)
+GetUnprocessedFilesForPipeline(char *pipelineName, int jobIndex)
 {
 	MemoryContext outerContext = CurrentMemoryContext;
 
@@ -333,17 +333,17 @@ GetUnprocessedFilesForPipeline(char *pipelineName, int shard)
 	SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, SECURITY_LOCAL_USERID_CHANGE);
 
 	/*
-	 * Get the file list pipeline properties. The unsharded query does not
-	 * read shard_count, such that existing pipelines keep working when the
+	 * Get the file list pipeline properties. The query for all jobs does not
+	 * read job_count, such that existing pipelines keep working when the
 	 * extension SQL has not been updated to 1.6 yet.
 	 */
-	char	   *query = shard == ALL_SHARDS ?
+	char	   *query = jobIndex == ALL_JOBS ?
 		"select batched, list_function, file_pattern, max_batch_size, max_batches_per_run "
 		"from incremental.file_list_pipelines "
 		"where pipeline_name operator(pg_catalog.=) $1 "
 		"for update" :
 		"select batched, list_function, file_pattern, max_batch_size, max_batches_per_run, "
-		"shard_count "
+		"job_count "
 		"from incremental.file_list_pipelines "
 		"where pipeline_name operator(pg_catalog.=) $1 "
 		"for share";
@@ -393,10 +393,10 @@ GetUnprocessedFilesForPipeline(char *pipelineName, int shard)
 	if (!maxBatchesIsNull)
 		maxBatchesPerRun = DatumGetInt32(maxBatchesDatum);
 
-	int			shardCount = 1;
+	int			jobCount = 1;
 
-	if (shard != ALL_SHARDS)
-		shardCount = DatumGetInt32(SPI_getbinval(row, rowDesc, 6, &isNull));
+	if (jobIndex != ALL_JOBS)
+		jobCount = DatumGetInt32(SPI_getbinval(row, rowDesc, 6, &isNull));
 
 	MemoryContext oldContext = MemoryContextSwitchTo(outerContext);
 
@@ -410,16 +410,16 @@ GetUnprocessedFilesForPipeline(char *pipelineName, int shard)
 
 	SetUserIdAndSecContext(savedUserId, savedSecurityContext);
 
-	if (shard != ALL_SHARDS)
+	if (jobIndex != ALL_JOBS)
 	{
-		if (shard < 0 || shard >= shardCount)
+		if (jobIndex < 0 || jobIndex >= jobCount)
 			ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-							errmsg("shard %d is out of range for pipeline \"%s\"",
-								   shard, pipelineName),
-							errdetail("The pipeline has %d shards, numbered 0 to %d.",
-									  shardCount, shardCount - 1)));
+							errmsg("job index %d is out of range for pipeline \"%s\"",
+								   jobIndex, pipelineName),
+							errdetail("The pipeline has %d jobs, numbered 0 to %d.",
+									  jobCount, jobCount - 1)));
 
-		LockFileListPipelineShard(pipelineName, shard);
+		LockFileListPipelineJob(pipelineName, jobIndex);
 	}
 
 	FileList   *fileList = (FileList *) palloc0(sizeof(FileList));
@@ -428,19 +428,19 @@ GetUnprocessedFilesForPipeline(char *pipelineName, int shard)
 	fileList->maxBatchSize = maxBatchSize;
 	fileList->maxBatchesPerRun = maxBatchesPerRun;
 	fileList->files = GetUnprocessedFileList(pipelineName, listFunction, filePattern,
-											 shardCount, shard);
+											 jobCount, jobIndex);
 
 	return fileList;
 }
 
 
 /*
- * LockFileListPipelineShard takes a transaction-level advisory lock on a
- * shard of a file list pipeline, such that concurrent executions of the
- * same shard are serialized.
+ * LockFileListPipelineJob takes a transaction-level advisory lock on a
+ * job of a file list pipeline, such that concurrent executions of the
+ * same job are serialized.
  */
 static void
-LockFileListPipelineShard(char *pipelineName, int shard)
+LockFileListPipelineJob(char *pipelineName, int jobIndex)
 {
 	char	   *query =
 		"select pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtext($1), $2)";
@@ -451,7 +451,7 @@ LockFileListPipelineShard(char *pipelineName, int shard)
 	Oid			argTypes[] = {TEXTOID, INT4OID};
 	Datum		argValues[] = {
 		CStringGetTextDatum(pipelineName),
-		Int32GetDatum(shard)
+		Int32GetDatum(jobIndex)
 	};
 	char	   *argNulls = "	";
 
@@ -469,12 +469,12 @@ LockFileListPipelineShard(char *pipelineName, int shard)
 
 /*
  * GetUnprocessedFileList lists the current set of files and subtracts
- * the already processed files. If shard is not ALL_SHARDS, only files
- * that hash to the given shard are returned.
+ * the already processed files. If jobIndex is not ALL_JOBS, only files
+ * that hash to the given job index are returned.
  */
 static List *
 GetUnprocessedFileList(char *pipelineName, char *listFunction, char *filePattern,
-					   int shardCount, int shard)
+					   int jobCount, int jobIndex)
 {
 	List	   *fileList = NIL;
 	MemoryContext outerContext = CurrentMemoryContext;
@@ -503,20 +503,20 @@ GetUnprocessedFileList(char *pipelineName, char *listFunction, char *filePattern
 					 "where proc.path is null",
 					 listFunction);
 
-	if (shard != ALL_SHARDS)
+	if (jobIndex != ALL_JOBS)
 		appendStringInfoString(query,
 							   " and pg_catalog.abs(pg_catalog.hashtextextended(list.path, 0) "
 							   "operator(pg_catalog.%) $3) operator(pg_catalog.=) $4");
 
 	bool		readOnly = false;
 	int			tupleCount = 0;
-	int			argCount = shard != ALL_SHARDS ? 4 : 2;
+	int			argCount = jobIndex != ALL_JOBS ? 4 : 2;
 	Oid			argTypes[] = {TEXTOID, TEXTOID, INT8OID, INT8OID};
 	Datum		argValues[] = {
 		CStringGetTextDatum(pipelineName),
 		CStringGetTextDatum(filePattern),
-		Int64GetDatum(shardCount),
-		Int64GetDatum(shard)
+		Int64GetDatum(jobCount),
+		Int64GetDatum(jobIndex)
 	};
 	char	   *argNulls = "	";
 
@@ -713,17 +713,17 @@ SanitizeListFunction(char *listFunction)
 
 
 /*
- * GetFileListPipelineShardCount returns the number of shards of a file
+ * GetFileListPipelineJobCount returns the number of jobs of a file
  * list pipeline.
  */
 int
-GetFileListPipelineShardCount(char *pipelineName)
+GetFileListPipelineJobCount(char *pipelineName)
 {
 	/*
-	 * Before the 1.6 upgrade, there is no shard_count column and all
-	 * pipelines are unsharded.
+	 * Before the 1.6 upgrade, there is no job_count column and all pipelines
+	 * have a single job.
 	 */
-	if (!ShardCountColumnExists())
+	if (!JobCountColumnExists())
 		return 1;
 
 	Oid			savedUserId = InvalidOid;
@@ -737,7 +737,7 @@ GetFileListPipelineShardCount(char *pipelineName)
 	SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, SECURITY_LOCAL_USERID_CHANGE);
 
 	char	   *query =
-		"select shard_count "
+		"select job_count "
 		"from incremental.file_list_pipelines "
 		"where pipeline_name operator(pg_catalog.=) $1";
 
@@ -765,27 +765,105 @@ GetFileListPipelineShardCount(char *pipelineName)
 							   pipelineName)));
 
 	bool		isNull = false;
-	Datum		shardCountDatum = SPI_getbinval(SPI_tuptable->vals[0],
-												SPI_tuptable->tupdesc, 1, &isNull);
-	int			shardCount = DatumGetInt32(shardCountDatum);
+	Datum		jobCountDatum = SPI_getbinval(SPI_tuptable->vals[0],
+											  SPI_tuptable->tupdesc, 1, &isNull);
+	int			jobCount = DatumGetInt32(jobCountDatum);
 
 	SPI_finish();
 
 	SetUserIdAndSecContext(savedUserId, savedSecurityContext);
 
-	return shardCount;
+	return jobCount;
 }
 
 
 /*
- * ShardCountColumnExists returns whether incremental.file_list_pipelines has
- * the shard_count column, which is added in extension version 1.6.
+ * JobCountColumnExists returns whether incremental.file_list_pipelines has
+ * the job_count column, which is added in extension version 1.6.
  */
 static bool
-ShardCountColumnExists(void)
+JobCountColumnExists(void)
 {
 	Oid			namespaceId = get_namespace_oid("incremental", false);
 	Oid			relationId = get_relname_relid("file_list_pipelines", namespaceId);
 
-	return get_attnum(relationId, "shard_count") != InvalidAttrNumber;
+	return get_attnum(relationId, "job_count") != InvalidAttrNumber;
+}
+
+
+/*
+ * SetFileListPipelineJobCount changes the number of jobs of a file list
+ * pipeline and returns the previous number of jobs. The pipeline row is
+ * locked first, which waits for running executions of the pipeline.
+ */
+int
+SetFileListPipelineJobCount(char *pipelineName, int jobCount)
+{
+	if (!JobCountColumnExists())
+		ereport(ERROR, (errmsg("extension needs to be updated to use job_count"),
+						errhint("Run ALTER EXTENSION pg_incremental UPDATE")));
+
+	Oid			savedUserId = InvalidOid;
+	int			savedSecurityContext = 0;
+
+	/*
+	 * Switch to superuser in case the current user does not have write
+	 * privileges for the pipelines table.
+	 */
+	GetUserIdAndSecContext(&savedUserId, &savedSecurityContext);
+	SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, SECURITY_LOCAL_USERID_CHANGE);
+
+	char	   *query =
+		"select job_count "
+		"from incremental.file_list_pipelines "
+		"where pipeline_name operator(pg_catalog.=) $1 "
+		"for update";
+
+	bool		readOnly = false;
+	int			tupleCount = 0;
+	int			argCount = 1;
+	Oid			argTypes[] = {TEXTOID, INT4OID};
+	Datum		argValues[] = {
+		CStringGetTextDatum(pipelineName),
+		Int32GetDatum(jobCount)
+	};
+	char	   *argNulls = "  ";
+
+	SPI_connect();
+	SPI_execute_with_args(query,
+						  argCount,
+						  argTypes,
+						  argValues,
+						  argNulls,
+						  readOnly,
+						  tupleCount);
+
+	if (SPI_processed <= 0)
+		ereport(ERROR, (errcode(ERRCODE_UNDEFINED_OBJECT),
+						errmsg("pipeline \"%s\" cannot be found",
+							   pipelineName)));
+
+	bool		isNull = false;
+	int			oldJobCount = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[0],
+														  SPI_tuptable->tupdesc, 1, &isNull));
+
+	query =
+		"update incremental.file_list_pipelines "
+		"set job_count = $2 "
+		"where pipeline_name operator(pg_catalog.=) $1";
+	argCount = 2;
+
+	SPI_execute_with_args(query,
+						  argCount,
+						  argTypes,
+						  argValues,
+						  argNulls,
+						  readOnly,
+						  tupleCount);
+
+	SPI_finish();
+
+	SetUserIdAndSecContext(savedUserId, savedSecurityContext);
+
+	return oldJobCount;
 }
