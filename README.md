@@ -246,8 +246,6 @@ Arguments of the `incremental.create_time_range_pipeline` function:
 
 ### Creating a file list pipeline
 
-Upgrading from extension version **1.4** to **1.5** runs `pg_incremental--1.4--1.5.sql`: it refreshes `_drop_extension_trigger` (including the `pg_cron` guard for `DROP EXTENSION`) and adds **`max_batches_per_run`** to `incremental.file_list_pipelines` and `incremental.create_file_list_pipeline`. Use `ALTER EXTENSION pg_incremental UPDATE TO '1.5';`.
-
 You can define a file list pipeline with the `incremental.create_file_list_pipeline` function by specifying a generic pipeline name, a file pattern, and a command. When the pipeline is not batched, the command runs with `$1` set to the path of a file (`text`). When batched, `$1` is a `text[]` of paths. Each call to `incremental.execute_pipeline` (or each pg\_cron run) lists unprocessed paths from your list function and runs the command up to **`max_batches_per_run`** times in that invocation: `-1` (default) means no limit—process every file (every batch when batched) in that run; a positive integer caps how many batch iterations run—each iteration is one file when not batched, or one array batch when batched. Remaining paths wait for the next run.
 
 Example:
@@ -282,6 +280,7 @@ Arguments of the `incremental.create_file_list_pipeline` function:
 | `schedule`            | text        | pg\_cron schedule for periodic execution (or NULL)  | `*/15 * * * *` (every 15 minutes)  |
 | `execute_immediately` | bool        | Execute command immediately for existing data       | `true`                             |
 | `max_batches_per_run` | int         | Max batch iterations per `execute_pipeline` call: `-1` = no limit (process full backlog in that run); a positive integer caps how many files (non-batched) or array batches (batched) run in that call | `-1`                               |
+| `job_count`           | int         | Number of parallel jobs that process files (see below) | `1`                                |
 
 Instead of using the argument, you can also change the default list function via the `incremental.default_file_list_function` setting:
 
@@ -289,6 +288,34 @@ Instead of using the argument, you can also change the default list function via
 -- change the default file list function (note: this function name is an example and not included in pg_incremental)
 set incremental.default_file_list_function to 'public.list_local_files';
 ```
+
+#### Processing files in parallel
+
+When the pipeline command only appends data (e.g. `insert into ... select` or `copy`, but not an upsert), you can process files in parallel by setting `job_count`. Each file is assigned to one of the jobs by a hash of its path, and each job is a separate pg\_cron job, named `pipeline:<pipeline_name>:job:<job_index>`, that calls `incremental.execute_pipeline(pipeline_name, job_index)`. Jobs run concurrently and each job tracks its files in `incremental.processed_files` in the same transaction as the command, so a failure in one job only rolls back the files of that job.
+
+With `job_count` greater than 1, `execute_immediately` does not process existing files in the create call, since that would process them serially. They are processed by the parallel jobs on their first run.
+
+```sql
+-- import new files using 8 parallel jobs, at most 10 files per job per run
+select incremental.create_file_list_pipeline('event-import', 's3://mybucket/events/inbox/*.csv', $$
+   select import_events($1)
+$$, job_count := 8, max_batches_per_run := 10);
+
+-- process the files of job 3 manually
+call incremental.execute_pipeline('event-import', 3);
+```
+
+You can change the number of jobs of an existing pipeline, for instance to temporarily increase parallelism during a backfill or a large load. The cron jobs are replaced by the new number of jobs with the same schedule, and files that were already processed stay processed.
+
+```sql
+-- use 32 jobs during a backfill
+select incremental.alter_file_list_pipeline('event-import', job_count := 32);
+
+-- back to 8 jobs afterwards
+select incremental.alter_file_list_pipeline('event-import', job_count := 8);
+```
+
+Calling `incremental.execute_pipeline(pipeline_name)` without a job index processes the files of all jobs, and waits for running jobs to finish. Make sure `cron.max_running_jobs` is at least the number of jobs.
 
 If you have a faulty file, you can skip it by running the `incremental.skip_file` function. It will be treated as already-processed and therefore skipped in future runs.
 ```sql

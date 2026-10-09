@@ -160,6 +160,107 @@ select count(*) from mcap_log;
 call incremental.execute_pipeline('batched-cap-one-batch-per-run');
 select count(*) from mcap_log;
 
+-- job_count: a pipeline whose jobs each process a disjoint subset of files
+insert into file_registry select '/par/' || i || '.csv' from generate_series(1, 20) i;
+create table par_log (path text, job_index int);
+
+-- with multiple jobs, existing files are not processed immediately
+select incremental.create_file_list_pipeline(
+    'parallel',
+    '/par/%.csv',
+    $$ insert into file_list.par_log values ($1, current_setting('file_list.job_index')::int) $$,
+    list_function := 'file_list.list_local_files',
+    schedule := NULL,
+    job_count := 3);
+select job_count from incremental.file_list_pipelines where pipeline_name = 'parallel';
+select count(*) from par_log;
+
+set file_list.job_index to 0;
+call incremental.execute_pipeline('parallel', 0);
+set file_list.job_index to 1;
+call incremental.execute_pipeline('parallel', 1);
+set file_list.job_index to 2;
+call incremental.execute_pipeline('parallel', 2);
+
+-- every file is processed exactly once, by the job its path hashes to
+select count(*), count(distinct path) from par_log;
+select count(*) from par_log
+where job_index <> abs(hashtextextended(path, 0) % 3);
+select count(*) > 0 from par_log group by job_index order by job_index;
+
+-- re-running a job does nothing
+call incremental.execute_pipeline('parallel', 0);
+select count(*) from par_log;
+
+-- executing without a job index processes new files of all jobs
+insert into file_registry select '/par/' || i || '.csv' from generate_series(21, 25) i;
+set file_list.job_index to -1;
+call incremental.execute_pipeline('parallel');
+select count(*), count(distinct path) from par_log;
+select count(*) from incremental.processed_files where pipeline_name = 'parallel';
+
+-- job index must be in range, and only file list pipelines can have multiple jobs
+call incremental.execute_pipeline('parallel', 3);
+call incremental.execute_pipeline('parallel', -1);
+call incremental.execute_pipeline('parallel', NULL);
+create table par_events (id bigserial, path text);
+select incremental.create_sequence_pipeline(
+    'not-a-file-list', 'file_list.par_events', $$ select $1, $2 $$, schedule := NULL);
+call incremental.execute_pipeline('not-a-file-list', 0);
+select incremental.alter_file_list_pipeline('not-a-file-list', 2);
+select incremental.create_file_list_pipeline(
+    'zero-jobs', '/par/%.csv', $$ select $1 $$,
+    list_function := 'file_list.list_local_files', schedule := NULL, job_count := 0);
+
+-- alter_file_list_pipeline: change the number of jobs; files keep their processed state
+select incremental.alter_file_list_pipeline('parallel', 0);
+select incremental.alter_file_list_pipeline('parallel', 2);
+select job_count from incremental.file_list_pipelines where pipeline_name = 'parallel';
+call incremental.execute_pipeline('parallel', 2);
+insert into file_registry select '/par/' || i || '.csv' from generate_series(26, 40) i;
+set file_list.job_index to 0;
+call incremental.execute_pipeline('parallel', 0);
+set file_list.job_index to 1;
+call incremental.execute_pipeline('parallel', 1);
+select count(*), count(distinct path) from par_log;
+select count(*) from par_log
+where substring(path from '/par/([0-9]+)')::int >= 26 and job_index <> abs(hashtextextended(path, 0) % 2);
+
+-- back to a single job
+select incremental.alter_file_list_pipeline('parallel', 1);
+insert into file_registry values ('/par/41.csv');
+set file_list.job_index to 0;
+call incremental.execute_pipeline('parallel', 0);
+call incremental.execute_pipeline('parallel');
+select count(*), count(distinct path) from par_log;
+
+-- batched pipeline with multiple jobs and max_batch_size
+insert into file_registry select '/bpar/' || i || '.csv' from generate_series(1, 10) i;
+create table bpar_log (batch_size int);
+select incremental.create_file_list_pipeline(
+    'batched-parallel',
+    '/bpar/%.csv',
+    $$ insert into file_list.bpar_log values (cardinality($1)) $$,
+    list_function := 'file_list.list_local_files',
+    batched := true,
+    max_batch_size := 2,
+    schedule := NULL,
+    execute_immediately := false,
+    job_count := 2);
+call incremental.execute_pipeline('batched-parallel', 0);
+call incremental.execute_pipeline('batched-parallel', 1);
+select sum(batch_size), max(batch_size) <= 2 from bpar_log;
+select count(*) from incremental.processed_files where pipeline_name = 'batched-parallel';
+
+-- reset clears the processed files of all jobs, and does not execute immediately
+select incremental.reset_pipeline('batched-parallel', execute_immediately := true);
+select count(*) from incremental.processed_files where pipeline_name = 'batched-parallel';
+select sum(batch_size) from bpar_log;
+
+-- drop a pipeline with multiple jobs
+select incremental.drop_pipeline('batched-parallel');
+select count(*) from incremental.file_list_pipelines where pipeline_name = 'batched-parallel';
+
 -- reset_pipeline: clears processed_files so all files are reprocessed
 select incremental.reset_pipeline('ingest-files', execute_immediately := false);
 call incremental.execute_pipeline('ingest-files');

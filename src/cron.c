@@ -70,11 +70,70 @@ ScheduleCronJob(char *jobName, char *schedule, char *command)
 
 
 /*
+ * GetCronJobSchedule returns the schedule of a pg_cron job, or NULL if
+ * pg_cron is not installed or there is no such job.
+ */
+char *
+GetCronJobSchedule(char *jobName)
+{
+	bool		missingOk = true;
+
+	if (get_extension_oid("pg_cron", missingOk) == InvalidOid)
+		return NULL;
+
+	MemoryContext outerContext = CurrentMemoryContext;
+
+	char	   *query =
+		"SELECT schedule FROM cron.job WHERE jobname = $1";
+
+	bool		readOnly = true;
+	int			tupleCount = 1;
+	int			argCount = 1;
+	Oid			argTypes[] = {TEXTOID};
+	Datum		argValues[] = {
+		CStringGetTextDatum(jobName)
+	};
+	char	   *argNulls = " ";
+
+	SPI_connect();
+	SPI_execute_with_args(query,
+						  argCount,
+						  argTypes,
+						  argValues,
+						  argNulls,
+						  readOnly,
+						  tupleCount);
+
+	char	   *schedule = NULL;
+
+	if (SPI_processed > 0)
+	{
+		bool		isNull = false;
+		Datum		scheduleDatum = SPI_getbinval(SPI_tuptable->vals[0],
+												  SPI_tuptable->tupdesc, 1, &isNull);
+
+		if (!isNull)
+			schedule = MemoryContextStrdup(outerContext, TextDatumGetCString(scheduleDatum));
+	}
+
+	SPI_finish();
+
+	return schedule;
+}
+
+
+/*
  * UnscheduleCronJob unschedules a pg_cron job.
  */
 void
 UnscheduleCronJob(char *jobName)
 {
+	bool		missingOk = true;
+
+	/* nothing to unschedule if pg_cron is not installed */
+	if (get_extension_oid("pg_cron", missingOk) == InvalidOid)
+		return;
+
 	char	   *query =
 		"SELECT cron.unschedule(jobid) from cron.job where jobname = $1";
 
