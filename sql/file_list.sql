@@ -160,6 +160,81 @@ select count(*) from mcap_log;
 call incremental.execute_pipeline('batched-cap-one-batch-per-run');
 select count(*) from mcap_log;
 
+-- shard_count: a sharded pipeline whose shards each process a disjoint subset of files
+insert into file_registry select '/shard/' || i || '.csv' from generate_series(1, 20) i;
+create table shard_log (path text, shard int);
+select incremental.create_file_list_pipeline(
+    'sharded',
+    '/shard/%.csv',
+    $$ insert into file_list.shard_log values ($1, current_setting('file_list.shard')::int) $$,
+    list_function := 'file_list.list_local_files',
+    schedule := NULL,
+    execute_immediately := false,
+    shard_count := 3);
+select shard_count from incremental.file_list_pipelines where pipeline_name = 'sharded';
+
+set file_list.shard to 0;
+call incremental.execute_pipeline('sharded', 0);
+set file_list.shard to 1;
+call incremental.execute_pipeline('sharded', 1);
+set file_list.shard to 2;
+call incremental.execute_pipeline('sharded', 2);
+
+-- every file is processed exactly once, by the shard its path hashes to
+select count(*), count(distinct path) from shard_log;
+select count(*) from shard_log
+where shard <> abs(hashtextextended(path, 0) % 3);
+select count(*) > 0 from shard_log group by shard order by shard;
+
+-- re-running a shard does nothing
+call incremental.execute_pipeline('sharded', 0);
+select count(*) from shard_log;
+
+-- an unsharded execution processes new files of all shards
+insert into file_registry select '/shard/' || i || '.csv' from generate_series(21, 25) i;
+set file_list.shard to -1;
+call incremental.execute_pipeline('sharded');
+select count(*), count(distinct path) from shard_log;
+select count(*) from incremental.processed_files where pipeline_name = 'sharded';
+
+-- shard must be in range, and only file list pipelines can be sharded
+call incremental.execute_pipeline('sharded', 3);
+call incremental.execute_pipeline('sharded', -1);
+call incremental.execute_pipeline('sharded', NULL);
+create table shard_events (id bigserial, path text);
+select incremental.create_sequence_pipeline(
+    'not-a-file-list', 'file_list.shard_events', $$ select $1, $2 $$, schedule := NULL);
+call incremental.execute_pipeline('not-a-file-list', 0);
+select incremental.create_file_list_pipeline(
+    'zero-shards', '/shard/%.csv', $$ select $1 $$,
+    list_function := 'file_list.list_local_files', schedule := NULL, shard_count := 0);
+
+-- batched sharded pipeline with max_batch_size
+insert into file_registry select '/bshard/' || i || '.csv' from generate_series(1, 10) i;
+create table bshard_log (batch_size int);
+select incremental.create_file_list_pipeline(
+    'batched-sharded',
+    '/bshard/%.csv',
+    $$ insert into file_list.bshard_log values (cardinality($1)) $$,
+    list_function := 'file_list.list_local_files',
+    batched := true,
+    max_batch_size := 2,
+    schedule := NULL,
+    execute_immediately := false,
+    shard_count := 2);
+call incremental.execute_pipeline('batched-sharded', 0);
+call incremental.execute_pipeline('batched-sharded', 1);
+select sum(batch_size), max(batch_size) <= 2 from bshard_log;
+select count(*) from incremental.processed_files where pipeline_name = 'batched-sharded';
+
+-- reset clears the processed files of all shards
+select incremental.reset_pipeline('batched-sharded', execute_immediately := false);
+select count(*) from incremental.processed_files where pipeline_name = 'batched-sharded';
+
+-- drop a sharded pipeline
+select incremental.drop_pipeline('batched-sharded');
+select count(*) from incremental.file_list_pipelines where pipeline_name = 'batched-sharded';
+
 -- reset_pipeline: clears processed_files so all files are reprocessed
 select incremental.reset_pipeline('ingest-files', execute_immediately := false);
 call incremental.execute_pipeline('ingest-files');

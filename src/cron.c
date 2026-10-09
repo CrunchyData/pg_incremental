@@ -75,6 +75,12 @@ ScheduleCronJob(char *jobName, char *schedule, char *command)
 void
 UnscheduleCronJob(char *jobName)
 {
+	bool		missingOk = true;
+
+	/* nothing to unschedule if pg_cron is not installed */
+	if (get_extension_oid("pg_cron", missingOk) == InvalidOid)
+		return;
+
 	char	   *query =
 		"SELECT cron.unschedule(jobid) from cron.job where jobname = $1";
 

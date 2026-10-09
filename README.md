@@ -246,6 +246,8 @@ Arguments of the `incremental.create_time_range_pipeline` function:
 
 ### Creating a file list pipeline
 
+Upgrading from extension version **1.5** to **1.6** runs `pg_incremental--1.5--1.6.sql`: it adds **`shard_count`** to `incremental.file_list_pipelines` and `incremental.create_file_list_pipeline`, and adds an `incremental.execute_pipeline(pipeline_name, shard)` procedure. Use `ALTER EXTENSION pg_incremental UPDATE TO '1.6';`.
+
 Upgrading from extension version **1.4** to **1.5** runs `pg_incremental--1.4--1.5.sql`: it refreshes `_drop_extension_trigger` (including the `pg_cron` guard for `DROP EXTENSION`) and adds **`max_batches_per_run`** to `incremental.file_list_pipelines` and `incremental.create_file_list_pipeline`. Use `ALTER EXTENSION pg_incremental UPDATE TO '1.5';`.
 
 You can define a file list pipeline with the `incremental.create_file_list_pipeline` function by specifying a generic pipeline name, a file pattern, and a command. When the pipeline is not batched, the command runs with `$1` set to the path of a file (`text`). When batched, `$1` is a `text[]` of paths. Each call to `incremental.execute_pipeline` (or each pg\_cron run) lists unprocessed paths from your list function and runs the command up to **`max_batches_per_run`** times in that invocation: `-1` (default) means no limit—process every file (every batch when batched) in that run; a positive integer caps how many batch iterations run—each iteration is one file when not batched, or one array batch when batched. Remaining paths wait for the next run.
@@ -282,6 +284,7 @@ Arguments of the `incremental.create_file_list_pipeline` function:
 | `schedule`            | text        | pg\_cron schedule for periodic execution (or NULL)  | `*/15 * * * *` (every 15 minutes)  |
 | `execute_immediately` | bool        | Execute command immediately for existing data       | `true`                             |
 | `max_batches_per_run` | int         | Max batch iterations per `execute_pipeline` call: `-1` = no limit (process full backlog in that run); a positive integer caps how many files (non-batched) or array batches (batched) run in that call | `-1`                               |
+| `shard_count`         | int         | Number of shards to split files into, to process them in parallel (see below) | `1`                                |
 
 Instead of using the argument, you can also change the default list function via the `incremental.default_file_list_function` setting:
 
@@ -289,6 +292,22 @@ Instead of using the argument, you can also change the default list function via
 -- change the default file list function (note: this function name is an example and not included in pg_incremental)
 set incremental.default_file_list_function to 'public.list_local_files';
 ```
+
+#### Processing files in parallel
+
+When the pipeline command only appends data (e.g. `insert into ... select` or `copy`, but not an upsert), you can process files in parallel by setting `shard_count`. Each file is assigned to one of the shards by a hash of its path, and each shard is processed by a separate pg\_cron job, named `pipeline:<pipeline_name>:shard:<shard>`, that calls `incremental.execute_pipeline(pipeline_name, shard)`. Shards run concurrently and each shard tracks its files in `incremental.processed_files` in the same transaction as the command, so a failure in one shard only rolls back the files of that shard.
+
+```sql
+-- import new files using 8 parallel jobs, at most 10 files per job per run
+select incremental.create_file_list_pipeline('event-import', 's3://mybucket/events/inbox/*.csv', $$
+   select import_events($1)
+$$, shard_count := 8, max_batches_per_run := 10);
+
+-- process a single shard manually
+call incremental.execute_pipeline('event-import', 3);
+```
+
+Calling `incremental.execute_pipeline(pipeline_name)` without a shard processes the files of all shards, and waits for running shards to finish. Make sure `cron.max_running_jobs` is at least the number of shards.
 
 If you have a faulty file, you can skip it by running the `incremental.skip_file` function. It will be treated as already-processed and therefore skipped in future runs.
 ```sql

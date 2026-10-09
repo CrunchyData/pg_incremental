@@ -41,9 +41,10 @@ static void ExecuteBatchedFileListPipeline(char *pipelineName, char *command, Fi
 										   int offset);
 static void ExecuteFileListPipelineForFileArray(char *pipelineName, char *command,
 												ArrayType *filePaths);
-static FileList * GetUnprocessedFilesForPipeline(char *pipelineName);
+static FileList * GetUnprocessedFilesForPipeline(char *pipelineName, int shard);
 static List *GetUnprocessedFileList(char *pipelineName, char *listFunction,
-									char *filePattern);
+									char *filePattern, int shardCount, int shard);
+static void LockFileListPipelineShard(char *pipelineName, int shard);
 
 
 /* crunchy_lake.default_file_list_function setting */
@@ -57,7 +58,7 @@ char	   *DefaultFileListFunction = DEFAULT_FILE_LIST_FUNCTION;
 void
 InitializeFileListPipelineState(char *pipelineName, char *pattern, bool batched,
 								char *listFunction, int maxBatchSize,
-								int maxBatchesPerRun)
+								int maxBatchesPerRun, int shardCount)
 {
 	Oid			savedUserId = InvalidOid;
 	int			savedSecurityContext = 0;
@@ -71,23 +72,25 @@ InitializeFileListPipelineState(char *pipelineName, char *pattern, bool batched,
 
 	char	   *query =
 		"insert into incremental.file_list_pipelines "
-		"(pipeline_name, file_pattern, batched, list_function, max_batch_size, max_batches_per_run) "
-		"values ($1, $2, $3, $4, $5, $6)";
+		"(pipeline_name, file_pattern, batched, list_function, max_batch_size, max_batches_per_run, "
+		"shard_count) "
+		"values ($1, $2, $3, $4, $5, $6, $7)";
 
 	bool		readOnly = false;
 	int			tupleCount = 0;
-	int			argCount = 6;
-	Oid			argTypes[] = {TEXTOID, TEXTOID, BOOLOID, TEXTOID, INT4OID, INT4OID};
+	int			argCount = 7;
+	Oid			argTypes[] = {TEXTOID, TEXTOID, BOOLOID, TEXTOID, INT4OID, INT4OID, INT4OID};
 	Datum		argValues[] = {
 		CStringGetTextDatum(pipelineName),
 		CStringGetTextDatum(pattern),
 		BoolGetDatum(batched),
 		CStringGetTextDatum(listFunction),
 		Int32GetDatum(maxBatchSize),
-		Int32GetDatum(maxBatchesPerRun)
+		Int32GetDatum(maxBatchesPerRun),
+		Int32GetDatum(shardCount)
 	};
 	char		argNulls[] = {
-		' ', ' ', ' ', ' ', maxBatchSize > 0 ? ' ' : 'n', ' '
+		' ', ' ', ' ', ' ', maxBatchSize > 0 ? ' ' : 'n', ' ', ' '
 	};
 
 	SPI_connect();
@@ -105,13 +108,16 @@ InitializeFileListPipelineState(char *pipelineName, char *pattern, bool batched,
 
 
 /*
- * ExecuteFileListPipeline executes a file list pipeline.
+ * ExecuteFileListPipeline executes a file list pipeline. If shard is
+ * ALL_SHARDS, all unprocessed files are considered. Otherwise, only the
+ * unprocessed files that hash to the given shard are considered, and
+ * other shards of the same pipeline can be executed concurrently.
  */
 void
-ExecuteFileListPipeline(char *pipelineName, char *command)
+ExecuteFileListPipeline(char *pipelineName, char *command, int shard)
 {
 	/* get the full fileList of data to process */
-	FileList   *fileList = GetUnprocessedFilesForPipeline(pipelineName);
+	FileList   *fileList = GetUnprocessedFilesForPipeline(pipelineName, shard);
 
 	if (fileList->files == NIL)
 	{
@@ -286,10 +292,18 @@ ExecuteFileListPipelineForFileArray(char *pipelineName, char *command, ArrayType
 
 /*
  * GetUnprocessedFilesForPipeline returns the list of files that are not
- * yet processed.
+ * yet processed, optionally restricted to a single shard.
+ *
+ * An unsharded execution locks the pipeline row exclusively, which
+ * serializes it with all other executions of the pipeline. A sharded
+ * execution only takes a share lock on the pipeline row, such that
+ * different shards can run concurrently, and an advisory lock on the
+ * shard, such that executions of the same shard are serialized. Shards
+ * process disjoint sets of files, so they never insert the same path into
+ * processed_files.
  */
 static FileList *
-GetUnprocessedFilesForPipeline(char *pipelineName)
+GetUnprocessedFilesForPipeline(char *pipelineName, int shard)
 {
 	MemoryContext outerContext = CurrentMemoryContext;
 
@@ -306,11 +320,17 @@ GetUnprocessedFilesForPipeline(char *pipelineName)
 	/*
 	 * Get the file list pipeline properties.
 	 */
-	char	   *query =
-		"select batched, list_function, file_pattern, max_batch_size, max_batches_per_run "
+	char	   *query = shard == ALL_SHARDS ?
+		"select batched, list_function, file_pattern, max_batch_size, max_batches_per_run, "
+		"shard_count "
 		"from incremental.file_list_pipelines "
 		"where pipeline_name operator(pg_catalog.=) $1 "
-		"for update";
+		"for update" :
+		"select batched, list_function, file_pattern, max_batch_size, max_batches_per_run, "
+		"shard_count "
+		"from incremental.file_list_pipelines "
+		"where pipeline_name operator(pg_catalog.=) $1 "
+		"for share";
 
 	bool		readOnly = false;
 	int			tupleCount = 0;
@@ -357,6 +377,9 @@ GetUnprocessedFilesForPipeline(char *pipelineName)
 	if (!maxBatchesIsNull)
 		maxBatchesPerRun = DatumGetInt32(maxBatchesDatum);
 
+	Datum		shardCountDatum = SPI_getbinval(row, rowDesc, 6, &isNull);
+	int			shardCount = DatumGetInt32(shardCountDatum);
+
 	MemoryContext oldContext = MemoryContextSwitchTo(outerContext);
 
 	bool		batched = DatumGetBool(batchedDatum);
@@ -369,23 +392,71 @@ GetUnprocessedFilesForPipeline(char *pipelineName)
 
 	SetUserIdAndSecContext(savedUserId, savedSecurityContext);
 
+	if (shard != ALL_SHARDS)
+	{
+		if (shard < 0 || shard >= shardCount)
+			ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+							errmsg("shard %d is out of range for pipeline \"%s\"",
+								   shard, pipelineName),
+							errdetail("The pipeline has %d shards, numbered 0 to %d.",
+									  shardCount, shardCount - 1)));
+
+		LockFileListPipelineShard(pipelineName, shard);
+	}
+
 	FileList   *fileList = (FileList *) palloc0(sizeof(FileList));
 
 	fileList->batched = batched;
 	fileList->maxBatchSize = maxBatchSize;
 	fileList->maxBatchesPerRun = maxBatchesPerRun;
-	fileList->files = GetUnprocessedFileList(pipelineName, listFunction, filePattern);
+	fileList->files = GetUnprocessedFileList(pipelineName, listFunction, filePattern,
+											 shardCount, shard);
 
 	return fileList;
 }
 
 
 /*
+ * LockFileListPipelineShard takes a transaction-level advisory lock on a
+ * shard of a file list pipeline, such that concurrent executions of the
+ * same shard are serialized.
+ */
+static void
+LockFileListPipelineShard(char *pipelineName, int shard)
+{
+	char	   *query =
+		"select pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtext($1), $2)";
+
+	bool		readOnly = false;
+	int			tupleCount = 0;
+	int			argCount = 2;
+	Oid			argTypes[] = {TEXTOID, INT4OID};
+	Datum		argValues[] = {
+		CStringGetTextDatum(pipelineName),
+		Int32GetDatum(shard)
+	};
+	char	   *argNulls = "	";
+
+	SPI_connect();
+	SPI_execute_with_args(query,
+						  argCount,
+						  argTypes,
+						  argValues,
+						  argNulls,
+						  readOnly,
+						  tupleCount);
+	SPI_finish();
+}
+
+
+/*
  * GetUnprocessedFileList lists the current set of files and subtracts
- * the already processed files,
+ * the already processed files. If shard is not ALL_SHARDS, only files
+ * that hash to the given shard are returned.
  */
 static List *
-GetUnprocessedFileList(char *pipelineName, char *listFunction, char *filePattern)
+GetUnprocessedFileList(char *pipelineName, char *listFunction, char *filePattern,
+					   int shardCount, int shard)
 {
 	List	   *fileList = NIL;
 	MemoryContext outerContext = CurrentMemoryContext;
@@ -414,15 +485,22 @@ GetUnprocessedFileList(char *pipelineName, char *listFunction, char *filePattern
 					 "where proc.path is null",
 					 listFunction);
 
+	if (shard != ALL_SHARDS)
+		appendStringInfoString(query,
+							   " and pg_catalog.abs(pg_catalog.hashtextextended(list.path, 0) "
+							   "operator(pg_catalog.%) $3) operator(pg_catalog.=) $4");
+
 	bool		readOnly = false;
 	int			tupleCount = 0;
-	int			argCount = 2;
-	Oid			argTypes[] = {TEXTOID, TEXTOID};
+	int			argCount = shard != ALL_SHARDS ? 4 : 2;
+	Oid			argTypes[] = {TEXTOID, TEXTOID, INT8OID, INT8OID};
 	Datum		argValues[] = {
 		CStringGetTextDatum(pipelineName),
-		CStringGetTextDatum(filePattern)
+		CStringGetTextDatum(filePattern),
+		Int64GetDatum(shardCount),
+		Int64GetDatum(shard)
 	};
-	char	   *argNulls = "  ";
+	char	   *argNulls = "	";
 
 	SPI_connect();
 	SPI_execute_with_args(query->data,
@@ -613,4 +691,62 @@ SanitizeListFunction(char *listFunction)
 	ReleaseSysCache(procTuple);
 
 	return quote_qualified_identifier(schemaName, functionName);
+}
+
+
+/*
+ * GetFileListPipelineShardCount returns the number of shards of a file
+ * list pipeline.
+ */
+int
+GetFileListPipelineShardCount(char *pipelineName)
+{
+	Oid			savedUserId = InvalidOid;
+	int			savedSecurityContext = 0;
+
+	/*
+	 * Switch to superuser in case the current user does not have read
+	 * privileges for the pipelines table.
+	 */
+	GetUserIdAndSecContext(&savedUserId, &savedSecurityContext);
+	SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, SECURITY_LOCAL_USERID_CHANGE);
+
+	char	   *query =
+		"select shard_count "
+		"from incremental.file_list_pipelines "
+		"where pipeline_name operator(pg_catalog.=) $1";
+
+	bool		readOnly = true;
+	int			tupleCount = 0;
+	int			argCount = 1;
+	Oid			argTypes[] = {TEXTOID};
+	Datum		argValues[] = {
+		CStringGetTextDatum(pipelineName)
+	};
+	char	   *argNulls = " ";
+
+	SPI_connect();
+	SPI_execute_with_args(query,
+						  argCount,
+						  argTypes,
+						  argValues,
+						  argNulls,
+						  readOnly,
+						  tupleCount);
+
+	if (SPI_processed <= 0)
+		ereport(ERROR, (errcode(ERRCODE_UNDEFINED_OBJECT),
+						errmsg("pipeline \"%s\" cannot be found",
+							   pipelineName)));
+
+	bool		isNull = false;
+	Datum		shardCountDatum = SPI_getbinval(SPI_tuptable->vals[0],
+												SPI_tuptable->tupdesc, 1, &isNull);
+	int			shardCount = DatumGetInt32(shardCountDatum);
+
+	SPI_finish();
+
+	SetUserIdAndSecContext(savedUserId, savedSecurityContext);
+
+	return shardCount;
 }
