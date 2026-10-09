@@ -46,6 +46,7 @@ static FileList * GetUnprocessedFilesForPipeline(char *pipelineName, int shard);
 static List *GetUnprocessedFileList(char *pipelineName, char *listFunction,
 									char *filePattern, int shardCount, int shard);
 static void LockFileListPipelineShard(char *pipelineName, int shard);
+static bool ShardCountColumnExists(void);
 
 
 /* crunchy_lake.default_file_list_function setting */
@@ -71,15 +72,28 @@ InitializeFileListPipelineState(char *pipelineName, char *pattern, bool batched,
 	GetUserIdAndSecContext(&savedUserId, &savedSecurityContext);
 	SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, SECURITY_LOCAL_USERID_CHANGE);
 
-	char	   *query =
+	/*
+	 * Before the 1.6 upgrade, there is no shard_count column and only
+	 * unsharded pipelines can be created.
+	 */
+	bool		hasShardCount = ShardCountColumnExists();
+
+	if (!hasShardCount && shardCount != 1)
+		ereport(ERROR, (errmsg("extension needs to be updated to use shard_count"),
+						errhint("Run ALTER EXTENSION pg_incremental UPDATE")));
+
+	char	   *query = hasShardCount ?
 		"insert into incremental.file_list_pipelines "
 		"(pipeline_name, file_pattern, batched, list_function, max_batch_size, max_batches_per_run, "
 		"shard_count) "
-		"values ($1, $2, $3, $4, $5, $6, $7)";
+		"values ($1, $2, $3, $4, $5, $6, $7)" :
+		"insert into incremental.file_list_pipelines "
+		"(pipeline_name, file_pattern, batched, list_function, max_batch_size, max_batches_per_run) "
+		"values ($1, $2, $3, $4, $5, $6)";
 
 	bool		readOnly = false;
 	int			tupleCount = 0;
-	int			argCount = 7;
+	int			argCount = hasShardCount ? 7 : 6;
 	Oid			argTypes[] = {TEXTOID, TEXTOID, BOOLOID, TEXTOID, INT4OID, INT4OID, INT4OID};
 	Datum		argValues[] = {
 		CStringGetTextDatum(pipelineName),
@@ -709,10 +723,7 @@ GetFileListPipelineShardCount(char *pipelineName)
 	 * Before the 1.6 upgrade, there is no shard_count column and all
 	 * pipelines are unsharded.
 	 */
-	Oid			namespaceId = get_namespace_oid("incremental", false);
-	Oid			relationId = get_relname_relid("file_list_pipelines", namespaceId);
-
-	if (get_attnum(relationId, "shard_count") == InvalidAttrNumber)
+	if (!ShardCountColumnExists())
 		return 1;
 
 	Oid			savedUserId = InvalidOid;
@@ -763,4 +774,18 @@ GetFileListPipelineShardCount(char *pipelineName)
 	SetUserIdAndSecContext(savedUserId, savedSecurityContext);
 
 	return shardCount;
+}
+
+
+/*
+ * ShardCountColumnExists returns whether incremental.file_list_pipelines has
+ * the shard_count column, which is added in extension version 1.6.
+ */
+static bool
+ShardCountColumnExists(void)
+{
+	Oid			namespaceId = get_namespace_oid("incremental", false);
+	Oid			relationId = get_relname_relid("file_list_pipelines", namespaceId);
+
+	return get_attnum(relationId, "shard_count") != InvalidAttrNumber;
 }
