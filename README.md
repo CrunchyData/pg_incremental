@@ -291,9 +291,9 @@ set incremental.default_file_list_function to 'public.list_local_files';
 
 #### Processing files in parallel
 
-When the pipeline command only appends data (e.g. `insert into ... select` or `copy`, but not an upsert), you can process files in parallel by setting `job_count`. Each file is assigned to one of the jobs by a hash of its path, and each job is a separate pg\_cron job, named `pipeline:<pipeline_name>:job:<job_index>`, that calls `incremental.execute_pipeline(pipeline_name, job_index)`. Jobs run concurrently and each job tracks its files in `incremental.processed_files` in the same transaction as the command, so a failure in one job only rolls back the files of that job.
+When the pipeline command only appends data (e.g. `insert into ... select` or `copy`, but not an upsert), you can process files in parallel by setting `job_count`. Each file is assigned to one of the jobs by a hash of its path, and each job is a separate pg\_cron job, named `pipeline:<pipeline_name>:job:<job_index>`, that calls `incremental.execute_pipeline(pipeline_name, job_index)`. Pipeline names ending in `:job:<number>` are not allowed, since their cron job name would clash with these. Jobs run concurrently and each job tracks its files in `incremental.processed_files` in the same transaction as the command, so a failure in one job only rolls back the files of that job.
 
-With `job_count` greater than 1, `execute_immediately` does not process existing files in the create call, since that would process them serially. They are processed by the parallel jobs on their first run.
+With `job_count` greater than 1, `execute_immediately` does not process existing files in the create call, since that would process them serially. They are processed by the parallel jobs on their first run, or, without a schedule, when you call `incremental.execute_pipeline(pipeline_name, job_index)` for each job.
 
 ```sql
 -- import new files using 8 parallel jobs, at most 10 files per job per run

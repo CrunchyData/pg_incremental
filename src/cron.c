@@ -70,11 +70,12 @@ ScheduleCronJob(char *jobName, char *schedule, char *command)
 
 
 /*
- * GetCronJobSchedule returns the schedule of a pg_cron job, or NULL if
- * pg_cron is not installed or there is no such job.
+ * GetCronJobSchedule returns the schedule of the pg_cron job with the given
+ * name and command, or NULL if pg_cron is not installed or there is no such
+ * job. Matching the command skips same-named jobs of other users.
  */
 char *
-GetCronJobSchedule(char *jobName)
+GetCronJobSchedule(char *jobName, char *command)
 {
 	bool		missingOk = true;
 
@@ -84,16 +85,17 @@ GetCronJobSchedule(char *jobName)
 	MemoryContext outerContext = CurrentMemoryContext;
 
 	char	   *query =
-		"SELECT schedule FROM cron.job WHERE jobname = $1";
+		"SELECT schedule FROM cron.job WHERE jobname = $1 AND command = $2";
 
 	bool		readOnly = true;
 	int			tupleCount = 1;
-	int			argCount = 1;
-	Oid			argTypes[] = {TEXTOID};
+	int			argCount = 2;
+	Oid			argTypes[] = {TEXTOID, TEXTOID};
 	Datum		argValues[] = {
-		CStringGetTextDatum(jobName)
+		CStringGetTextDatum(jobName),
+		CStringGetTextDatum(command)
 	};
-	char	   *argNulls = " ";
+	char		argNulls[] = {' ', ' '};
 
 	SPI_connect();
 	SPI_execute_with_args(query,

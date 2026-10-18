@@ -29,6 +29,7 @@ static void DeletePipeline(char *pipelineName);
 static char *GetCronJobNameForPipeline(char *pipelineName);
 static char *GetCronCommandForPipeline(char *pipelineName);
 static char *GetCronJobNameForPipelineJob(char *pipelineName, int jobIndex);
+static bool IsCronJobNameForPipelineJob(char *pipelineName);
 static char *GetCronCommandForPipelineJob(char *pipelineName, int jobIndex);
 static void ScheduleFileListPipelineJobs(char *pipelineName, char *schedule, int jobCount);
 static void UnscheduleFileListPipelineJobs(char *pipelineName, int jobCount);
@@ -285,7 +286,13 @@ incremental_create_file_list_pipeline(PG_FUNCTION_ARGS)
 	 * With multiple jobs, existing files are left to the jobs, since
 	 * executing here would process them serially.
 	 */
-	if (executeImmediately && jobCount > 1)
+	if (executeImmediately && jobCount > 1 && schedule == NULL)
+		ereport(NOTICE, (errmsg("pipeline %s: not executing immediately, files are "
+								"processed by %d parallel jobs", pipelineName, jobCount),
+						 errhint("Without a schedule, call incremental.execute_pipeline(%s, job_index) "
+								 "for each job index from 0 to %d.",
+								 quote_literal_cstr(pipelineName), jobCount - 1)));
+	else if (executeImmediately && jobCount > 1)
 		ereport(NOTICE, (errmsg("pipeline %s: not executing immediately, files are "
 								"processed by %d parallel jobs", pipelineName, jobCount)));
 	else if (executeImmediately)
@@ -400,7 +407,10 @@ incremental_alter_file_list_pipeline(PG_FUNCTION_ARGS)
 	char	   *firstJobName = oldJobCount == 1 ?
 		GetCronJobNameForPipeline(pipelineName) :
 		GetCronJobNameForPipelineJob(pipelineName, 0);
-	char	   *schedule = GetCronJobSchedule(firstJobName);
+	char	   *firstJobCommand = oldJobCount == 1 ?
+		GetCronCommandForPipeline(pipelineName) :
+		GetCronCommandForPipelineJob(pipelineName, 0);
+	char	   *schedule = GetCronJobSchedule(firstJobName, firstJobCommand);
 
 	if (schedule != NULL)
 	{
@@ -423,12 +433,14 @@ incremental_reset_pipeline(PG_FUNCTION_ARGS)
 	bool		executeImmediately = PG_ARGISNULL(1) ? false : PG_GETARG_BOOL(1);
 
 	EnsurePipelineOwner(pipelineName, pipelineDesc->ownerId);
-	ResetPipeline(pipelineName, pipelineDesc->pipelineType);
 
 	int			jobCount = 1;
 
+	/* also waits for running executions of the pipeline */
 	if (pipelineDesc->pipelineType == FILE_LIST_PIPELINE)
 		jobCount = GetFileListPipelineJobCount(pipelineName);
+
+	ResetPipeline(pipelineName, pipelineDesc->pipelineType);
 
 	/* with multiple jobs, reprocessing is left to the jobs, as in create */
 	if (executeImmediately && jobCount > 1)
@@ -473,6 +485,13 @@ static void
 InsertPipeline(char *pipelineName, PipelineType pipelineType, Oid sourceRelationId,
 			   char *command, char *searchPath)
 {
+	if (IsCronJobNameForPipelineJob(pipelineName))
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("pipeline name \"%s\" cannot end in :job:<number>",
+							   pipelineName),
+						errdetail("The name would clash with the cron job of a parallel "
+								  "file list pipeline job.")));
+
 	Oid			savedUserId = InvalidOid;
 	int			savedSecurityContext = 0;
 
@@ -752,6 +771,31 @@ static char *
 GetCronJobNameForPipelineJob(char *pipelineName, int jobIndex)
 {
 	return psprintf("pipeline:%s:job:%d", pipelineName, jobIndex);
+}
+
+
+/*
+ * IsCronJobNameForPipelineJob returns whether a pipeline name ends in
+ * :job:<number>, such that its cron job name would be the same as that of a
+ * job of another pipeline.
+ */
+static bool
+IsCronJobNameForPipelineJob(char *pipelineName)
+{
+	char	   *suffix = NULL;
+
+	for (char *match = strstr(pipelineName, ":job:"); match != NULL;
+		 match = strstr(match + 1, ":job:"))
+		suffix = match + strlen(":job:");
+
+	if (suffix == NULL || *suffix == '\0')
+		return false;
+
+	for (char *digit = suffix; *digit != '\0'; digit++)
+		if (!isdigit((unsigned char) *digit))
+			return false;
+
+	return true;
 }
 
 

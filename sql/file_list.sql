@@ -267,5 +267,14 @@ call incremental.execute_pipeline('ingest-files');
 -- a.csv–d.csv were processed once before reset and once after: 4 + 4 = 8
 select count(*) from processed_log;
 
+-- pipeline names must not clash with the cron job names of parallel jobs
+select incremental.create_file_list_pipeline('parallel:job:0', '/data/%.csv',
+    $$ insert into file_list.processed_log values ($1) $$,
+    list_function := 'file_list.list_local_files', schedule := NULL);
+select incremental.create_file_list_pipeline('parallel:job:x', '/data/%.csv',
+    $$ select $1 $$,
+    list_function := 'file_list.list_local_files', schedule := NULL, execute_immediately := false);
+select incremental.drop_pipeline('parallel:job:x');
+
 drop schema file_list cascade;
 drop extension pg_incremental;

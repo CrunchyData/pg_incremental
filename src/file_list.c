@@ -72,28 +72,15 @@ InitializeFileListPipelineState(char *pipelineName, char *pattern, bool batched,
 	GetUserIdAndSecContext(&savedUserId, &savedSecurityContext);
 	SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, SECURITY_LOCAL_USERID_CHANGE);
 
-	/*
-	 * Before the 1.6 upgrade, there is no job_count column and only
-	 * single-job pipelines can be created.
-	 */
-	bool		hasJobCount = JobCountColumnExists();
-
-	if (!hasJobCount && jobCount != 1)
-		ereport(ERROR, (errmsg("extension needs to be updated to use job_count"),
-						errhint("Run ALTER EXTENSION pg_incremental UPDATE")));
-
-	char	   *query = hasJobCount ?
+	char	   *query =
 		"insert into incremental.file_list_pipelines "
 		"(pipeline_name, file_pattern, batched, list_function, max_batch_size, max_batches_per_run, "
 		"job_count) "
-		"values ($1, $2, $3, $4, $5, $6, $7)" :
-		"insert into incremental.file_list_pipelines "
-		"(pipeline_name, file_pattern, batched, list_function, max_batch_size, max_batches_per_run) "
-		"values ($1, $2, $3, $4, $5, $6)";
+		"values ($1, $2, $3, $4, $5, $6, $7)";
 
 	bool		readOnly = false;
 	int			tupleCount = 0;
-	int			argCount = hasJobCount ? 7 : 6;
+	int			argCount = 7;
 	Oid			argTypes[] = {TEXTOID, TEXTOID, BOOLOID, TEXTOID, INT4OID, INT4OID, INT4OID};
 	Datum		argValues[] = {
 		CStringGetTextDatum(pipelineName),
@@ -453,7 +440,7 @@ LockFileListPipelineJob(char *pipelineName, int jobIndex)
 		CStringGetTextDatum(pipelineName),
 		Int32GetDatum(jobIndex)
 	};
-	char	   *argNulls = "	";
+	char		argNulls[] = {' ', ' '};
 
 	SPI_connect();
 	SPI_execute_with_args(query,
@@ -518,7 +505,7 @@ GetUnprocessedFileList(char *pipelineName, char *listFunction, char *filePattern
 		Int64GetDatum(jobCount),
 		Int64GetDatum(jobIndex)
 	};
-	char	   *argNulls = "	";
+	char		argNulls[] = {' ', ' ', ' ', ' '};
 
 	SPI_connect();
 	SPI_execute_with_args(query->data,
@@ -714,7 +701,8 @@ SanitizeListFunction(char *listFunction)
 
 /*
  * GetFileListPipelineJobCount returns the number of jobs of a file
- * list pipeline.
+ * list pipeline, and locks the pipeline row such that the number of jobs
+ * cannot change until the end of the transaction.
  */
 int
 GetFileListPipelineJobCount(char *pipelineName)
@@ -739,9 +727,10 @@ GetFileListPipelineJobCount(char *pipelineName)
 	char	   *query =
 		"select job_count "
 		"from incremental.file_list_pipelines "
-		"where pipeline_name operator(pg_catalog.=) $1";
+		"where pipeline_name operator(pg_catalog.=) $1 "
+		"for update";
 
-	bool		readOnly = true;
+	bool		readOnly = false;
 	int			tupleCount = 0;
 	int			argCount = 1;
 	Oid			argTypes[] = {TEXTOID};
