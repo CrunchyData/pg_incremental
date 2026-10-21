@@ -4,6 +4,8 @@
 * Add `incremental.alter_file_list_pipeline(pipeline_name, job_count)` to change the number of parallel jobs of a file list pipeline, for instance during a backfill.
 * With `job_count` greater than 1, `execute_immediately` in `create_file_list_pipeline` and `reset_pipeline` leaves existing files to the parallel jobs.
 * `incremental.drop_pipeline` no longer fails when pg\_cron is not installed.
+* Pipeline names ending in `:job:<number>` are no longer allowed, and scheduling fails instead of replacing an existing pg\_cron job with the same name and a different command.
+* Existing file list pipelines keep working with the new library before `ALTER EXTENSION pg_incremental UPDATE` has run on a 1.4 schema (v1.5.0 failed with `column "max_batches_per_run" does not exist`).
 
 ### pg\_incremental v1.5.0
 

@@ -505,5 +505,95 @@ select incremental.drop_pipeline('parallel:job:x');
  
 (1 row)
 
+create extension if not exists pg_cron;
+-- scheduled jobs: a yearly schedule, such that cron does not run them during the test
+select incremental.create_file_list_pipeline('cron-parallel', '/data/%.csv', $$ select $1 $$,
+    list_function := 'file_list.list_local_files', schedule := '0 0 1 1 *',
+    execute_immediately := false, job_count := 4);
+ create_file_list_pipeline 
+---------------------------
+ 
+(1 row)
+
+select jobname, schedule, command from cron.job where jobname like 'pipeline:cron-parallel%' order by 1;
+           jobname            | schedule  |                        command                        
+------------------------------+-----------+-------------------------------------------------------
+ pipeline:cron-parallel:job:0 | 0 0 1 1 * | call incremental.execute_pipeline('cron-parallel', 0)
+ pipeline:cron-parallel:job:1 | 0 0 1 1 * | call incremental.execute_pipeline('cron-parallel', 1)
+ pipeline:cron-parallel:job:2 | 0 0 1 1 * | call incremental.execute_pipeline('cron-parallel', 2)
+ pipeline:cron-parallel:job:3 | 0 0 1 1 * | call incremental.execute_pipeline('cron-parallel', 3)
+(4 rows)
+
+-- alter finds the schedule and removes leftover jobs when job 0 was unscheduled
+select cron.unschedule('pipeline:cron-parallel:job:0');
+ unschedule 
+------------
+ t
+(1 row)
+
+select incremental.alter_file_list_pipeline('cron-parallel', 2);
+ alter_file_list_pipeline 
+--------------------------
+ 
+(1 row)
+
+select jobname, schedule, command from cron.job where jobname like 'pipeline:cron-parallel%' order by 1;
+           jobname            | schedule  |                        command                        
+------------------------------+-----------+-------------------------------------------------------
+ pipeline:cron-parallel:job:0 | 0 0 1 1 * | call incremental.execute_pipeline('cron-parallel', 0)
+ pipeline:cron-parallel:job:1 | 0 0 1 1 * | call incremental.execute_pipeline('cron-parallel', 1)
+(2 rows)
+
+-- more jobs than cron.max_running_jobs gives a warning
+select incremental.alter_file_list_pipeline('cron-parallel', 40);
+WARNING:  pipeline cron-parallel: job_count 40 exceeds cron.max_running_jobs (32)
+DETAIL:  Not all jobs can run at the same time.
+ alter_file_list_pipeline 
+--------------------------
+ 
+(1 row)
+
+select count(*) from cron.job where jobname like 'pipeline:cron-parallel%';
+ count 
+-------
+    40
+(1 row)
+
+select incremental.drop_pipeline('cron-parallel');
+ drop_pipeline 
+---------------
+ 
+(1 row)
+
+select count(*) from cron.job where jobname like 'pipeline:cron-parallel%';
+ count 
+-------
+     0
+(1 row)
+
+-- an existing cron job with the same name and another command is not replaced
+select cron.schedule('pipeline:clash', '0 0 1 1 *', 'select 1') > 0;
+ ?column? 
+----------
+ t
+(1 row)
+
+select incremental.create_file_list_pipeline('clash', '/data/%.csv', $$ select $1 $$,
+    list_function := 'file_list.list_local_files', schedule := '0 0 1 1 *',
+    execute_immediately := false);
+ERROR:  cron job "pipeline:clash" already exists
+DETAIL:  The job runs: select 1
+select command from cron.job where jobname = 'pipeline:clash';
+ command  
+----------
+ select 1
+(1 row)
+
+select cron.unschedule('pipeline:clash');
+ unschedule 
+------------
+ t
+(1 row)
+
 drop schema file_list cascade;
 drop extension pg_incremental;

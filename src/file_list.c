@@ -46,7 +46,7 @@ static FileList * GetUnprocessedFilesForPipeline(char *pipelineName, int jobInde
 static List *GetUnprocessedFileList(char *pipelineName, char *listFunction,
 									char *filePattern, int jobCount, int jobIndex);
 static void LockFileListPipelineJob(char *pipelineName, int jobIndex);
-static bool JobCountColumnExists(void);
+static bool FileListPipelinesHasColumn(char *columnName);
 
 
 /* crunchy_lake.default_file_list_function setting */
@@ -320,20 +320,33 @@ GetUnprocessedFilesForPipeline(char *pipelineName, int jobIndex)
 	SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, SECURITY_LOCAL_USERID_CHANGE);
 
 	/*
-	 * Get the file list pipeline properties. The query for all jobs does not
-	 * read job_count, such that existing pipelines keep working when the
-	 * extension SQL has not been updated to 1.6 yet.
+	 * Get the file list pipeline properties. The query for all jobs only reads
+	 * columns that exist in older extension versions, such that existing
+	 * pipelines keep working when ALTER EXTENSION .. UPDATE has not run yet.
+	 * max_batches_per_run is added in 1.5 and job_count in 1.6, and executing
+	 * a single job requires 1.6.
 	 */
-	char	   *query = jobIndex == ALL_JOBS ?
-		"select batched, list_function, file_pattern, max_batch_size, max_batches_per_run "
-		"from incremental.file_list_pipelines "
-		"where pipeline_name operator(pg_catalog.=) $1 "
-		"for update" :
-		"select batched, list_function, file_pattern, max_batch_size, max_batches_per_run, "
-		"job_count "
-		"from incremental.file_list_pipelines "
-		"where pipeline_name operator(pg_catalog.=) $1 "
-		"for share";
+	char	   *query = NULL;
+
+	if (jobIndex != ALL_JOBS)
+		query =
+			"select batched, list_function, file_pattern, max_batch_size, max_batches_per_run, "
+			"job_count "
+			"from incremental.file_list_pipelines "
+			"where pipeline_name operator(pg_catalog.=) $1 "
+			"for share";
+	else if (FileListPipelinesHasColumn("max_batches_per_run"))
+		query =
+			"select batched, list_function, file_pattern, max_batch_size, max_batches_per_run "
+			"from incremental.file_list_pipelines "
+			"where pipeline_name operator(pg_catalog.=) $1 "
+			"for update";
+	else
+		query =
+			"select batched, list_function, file_pattern, max_batch_size, null::int "
+			"from incremental.file_list_pipelines "
+			"where pipeline_name operator(pg_catalog.=) $1 "
+			"for update";
 
 	bool		readOnly = false;
 	int			tupleCount = 0;
@@ -711,7 +724,7 @@ GetFileListPipelineJobCount(char *pipelineName)
 	 * Before the 1.6 upgrade, there is no job_count column and all pipelines
 	 * have a single job.
 	 */
-	if (!JobCountColumnExists())
+	if (!FileListPipelinesHasColumn("job_count"))
 		return 1;
 
 	Oid			savedUserId = InvalidOid;
@@ -767,16 +780,17 @@ GetFileListPipelineJobCount(char *pipelineName)
 
 
 /*
- * JobCountColumnExists returns whether incremental.file_list_pipelines has
- * the job_count column, which is added in extension version 1.6.
+ * FileListPipelinesHasColumn returns whether incremental.file_list_pipelines
+ * has the given column, which is not the case for columns added by an
+ * extension update that has not run yet.
  */
 static bool
-JobCountColumnExists(void)
+FileListPipelinesHasColumn(char *columnName)
 {
 	Oid			namespaceId = get_namespace_oid("incremental", false);
 	Oid			relationId = get_relname_relid("file_list_pipelines", namespaceId);
 
-	return get_attnum(relationId, "job_count") != InvalidAttrNumber;
+	return get_attnum(relationId, columnName) != InvalidAttrNumber;
 }
 
 
@@ -788,7 +802,7 @@ JobCountColumnExists(void)
 int
 SetFileListPipelineJobCount(char *pipelineName, int jobCount)
 {
-	if (!JobCountColumnExists())
+	if (!FileListPipelinesHasColumn("job_count"))
 		ereport(ERROR, (errmsg("extension needs to be updated to use job_count"),
 						errhint("Run ALTER EXTENSION pg_incremental UPDATE")));
 

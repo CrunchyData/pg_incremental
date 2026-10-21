@@ -15,6 +15,7 @@
 #include "tcop/tcopprot.h"
 #include "tcop/utility.h"
 #include "utils/builtins.h"
+#include "utils/guc.h"
 #include "utils/lsyscache.h"
 #include "utils/timestamp.h"
 #include "utils/ruleutils.h"
@@ -32,6 +33,8 @@ static char *GetCronJobNameForPipelineJob(char *pipelineName, int jobIndex);
 static bool IsCronJobNameForPipelineJob(char *pipelineName);
 static char *GetCronCommandForPipelineJob(char *pipelineName, int jobIndex);
 static void ScheduleFileListPipelineJobs(char *pipelineName, char *schedule, int jobCount);
+static int64 ScheduleFileListPipelineJob(char *jobName, char *command, char *schedule);
+static char *GetFileListPipelineSchedule(char *pipelineName, int jobCount);
 static void UnscheduleFileListPipelineJobs(char *pipelineName, int jobCount);
 
 
@@ -403,20 +406,13 @@ incremental_alter_file_list_pipeline(PG_FUNCTION_ARGS)
 	if (oldJobCount == jobCount)
 		PG_RETURN_VOID();
 
-	/* the first job always exists if the pipeline is scheduled */
-	char	   *firstJobName = oldJobCount == 1 ?
-		GetCronJobNameForPipeline(pipelineName) :
-		GetCronJobNameForPipelineJob(pipelineName, 0);
-	char	   *firstJobCommand = oldJobCount == 1 ?
-		GetCronCommandForPipeline(pipelineName) :
-		GetCronCommandForPipelineJob(pipelineName, 0);
-	char	   *schedule = GetCronJobSchedule(firstJobName, firstJobCommand);
+	char	   *schedule = GetFileListPipelineSchedule(pipelineName, oldJobCount);
+
+	/* also removes jobs left over when only some of them were unscheduled */
+	UnscheduleFileListPipelineJobs(pipelineName, oldJobCount);
 
 	if (schedule != NULL)
-	{
-		UnscheduleFileListPipelineJobs(pipelineName, oldJobCount);
 		ScheduleFileListPipelineJobs(pipelineName, schedule, jobCount);
-	}
 
 	PG_RETURN_VOID();
 }
@@ -820,10 +816,9 @@ ScheduleFileListPipelineJobs(char *pipelineName, char *schedule, int jobCount)
 {
 	if (jobCount == 1)
 	{
-		char	   *jobName = GetCronJobNameForPipeline(pipelineName);
-		char	   *cronCommand = GetCronCommandForPipeline(pipelineName);
-
-		int64		jobId = ScheduleCronJob(jobName, schedule, cronCommand);
+		int64		jobId = ScheduleFileListPipelineJob(GetCronJobNameForPipeline(pipelineName),
+													 GetCronCommandForPipeline(pipelineName),
+													 schedule);
 
 		ereport(NOTICE, (errmsg("pipeline %s: scheduled cron job with ID " INT64_FORMAT
 								" and schedule %s",
@@ -831,18 +826,67 @@ ScheduleFileListPipelineJobs(char *pipelineName, char *schedule, int jobCount)
 		return;
 	}
 
+	const char *maxRunningJobs = GetConfigOption("cron.max_running_jobs", true, false);
+
+	if (maxRunningJobs != NULL && jobCount > atoi(maxRunningJobs))
+		ereport(WARNING, (errmsg("pipeline %s: job_count %d exceeds cron.max_running_jobs (%s)",
+							  pipelineName, jobCount, maxRunningJobs),
+						  errdetail("Not all jobs can run at the same time.")));
+
 	/* schedule a cron job per job index, such that jobs run in parallel */
 	for (int jobIndex = 0; jobIndex < jobCount; jobIndex++)
 	{
-		char	   *jobName = GetCronJobNameForPipelineJob(pipelineName, jobIndex);
-		char	   *cronCommand = GetCronCommandForPipelineJob(pipelineName, jobIndex);
-
-		int64		jobId = ScheduleCronJob(jobName, schedule, cronCommand);
+		int64		jobId = ScheduleFileListPipelineJob(GetCronJobNameForPipelineJob(pipelineName, jobIndex),
+													 GetCronCommandForPipelineJob(pipelineName, jobIndex),
+													 schedule);
 
 		ereport(NOTICE, (errmsg("pipeline %s: scheduled cron job with ID " INT64_FORMAT
 								" for job index %d and schedule %s",
 								pipelineName, jobId, jobIndex, schedule)));
 	}
+}
+
+
+/*
+ * ScheduleFileListPipelineJob schedules a single cron job, unless a job with
+ * the same name runs a different command, which would be replaced.
+ */
+static int64
+ScheduleFileListPipelineJob(char *jobName, char *command, char *schedule)
+{
+	char	   *existingCommand = GetCronJobCommand(jobName);
+
+	if (existingCommand != NULL && strcmp(existingCommand, command) != 0)
+		ereport(ERROR, (errcode(ERRCODE_DUPLICATE_OBJECT),
+						errmsg("cron job \"%s\" already exists", jobName),
+						errdetail("The job runs: %s", existingCommand)));
+
+	return ScheduleCronJob(jobName, schedule, command);
+}
+
+
+/*
+ * GetFileListPipelineSchedule returns the schedule of the first cron job of a
+ * file list pipeline that still exists, or NULL if it is not scheduled.
+ */
+static char *
+GetFileListPipelineSchedule(char *pipelineName, int jobCount)
+{
+	if (jobCount == 1)
+		return GetCronJobSchedule(GetCronJobNameForPipeline(pipelineName),
+								  GetCronCommandForPipeline(pipelineName));
+
+	for (int jobIndex = 0; jobIndex < jobCount; jobIndex++)
+	{
+		char	   *schedule =
+			GetCronJobSchedule(GetCronJobNameForPipelineJob(pipelineName, jobIndex),
+							   GetCronCommandForPipelineJob(pipelineName, jobIndex));
+
+		if (schedule != NULL)
+			return schedule;
+	}
+
+	return NULL;
 }
 
 
