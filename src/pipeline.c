@@ -15,6 +15,7 @@
 #include "tcop/tcopprot.h"
 #include "tcop/utility.h"
 #include "utils/builtins.h"
+#include "utils/guc.h"
 #include "utils/lsyscache.h"
 #include "utils/timestamp.h"
 #include "utils/ruleutils.h"
@@ -23,11 +24,18 @@ static void InsertPipeline(char *pipelineName, PipelineType pipelineType, Oid so
 						   char *command, char *searchPath);
 static void EnsurePipelineOwner(char *pipelineName, Oid ownerId);
 static void ExecutePipeline(char *pipelineName, PipelineType pipelineType,
-							char *command, char *searchPath);
+							char *command, char *searchPath, int jobIndex);
 static void ResetPipeline(char *pipelineName, PipelineType pipelineType);
 static void DeletePipeline(char *pipelineName);
 static char *GetCronJobNameForPipeline(char *pipelineName);
 static char *GetCronCommandForPipeline(char *pipelineName);
+static char *GetCronJobNameForPipelineJob(char *pipelineName, int jobIndex);
+static bool IsCronJobNameForPipelineJob(char *pipelineName);
+static char *GetCronCommandForPipelineJob(char *pipelineName, int jobIndex);
+static void ScheduleFileListPipelineJobs(char *pipelineName, char *schedule, int jobCount);
+static int64 ScheduleFileListPipelineJob(char *jobName, char *command, char *schedule);
+static char *GetFileListPipelineSchedule(char *pipelineName, int jobCount);
+static void UnscheduleFileListPipelineJobs(char *pipelineName, int jobCount);
 
 
 PG_FUNCTION_INFO_V1(incremental_create_sequence_pipeline);
@@ -35,6 +43,8 @@ PG_FUNCTION_INFO_V1(incremental_create_time_interval_pipeline);
 PG_FUNCTION_INFO_V1(incremental_create_file_list_pipeline);
 PG_FUNCTION_INFO_V1(incremental_skip_file);
 PG_FUNCTION_INFO_V1(incremental_execute_pipeline);
+PG_FUNCTION_INFO_V1(incremental_execute_pipeline_job);
+PG_FUNCTION_INFO_V1(incremental_alter_file_list_pipeline);
 PG_FUNCTION_INFO_V1(incremental_reset_pipeline);
 PG_FUNCTION_INFO_V1(incremental_drop_pipeline);
 
@@ -114,7 +124,8 @@ incremental_create_sequence_pipeline(PG_FUNCTION_ARGS)
 	InitializeSequencePipelineState(pipelineName, sequenceId, maxBatchSize);
 
 	if (executeImmediately)
-		ExecutePipeline(pipelineName, SEQUENCE_RANGE_PIPELINE, command, searchPath);
+		ExecutePipeline(pipelineName, SEQUENCE_RANGE_PIPELINE, command, searchPath,
+						ALL_JOBS);
 
 	if (schedule != NULL)
 	{
@@ -181,7 +192,8 @@ incremental_create_time_interval_pipeline(PG_FUNCTION_ARGS)
 	InitializeTimeRangePipelineState(pipelineName, batched, startTime, timeInterval, minDelay);
 
 	if (executeImmediately)
-		ExecutePipeline(pipelineName, TIME_INTERVAL_PIPELINE, command, searchPath);
+		ExecutePipeline(pipelineName, TIME_INTERVAL_PIPELINE, command, searchPath,
+						ALL_JOBS);
 
 	if (schedule != NULL)
 	{
@@ -206,7 +218,7 @@ incremental_create_time_interval_pipeline(PG_FUNCTION_ARGS)
 Datum
 incremental_create_file_list_pipeline(PG_FUNCTION_ARGS)
 {
-	if (PG_NARGS() != 9)
+	if (PG_NARGS() != 10)
 		ereport(ERROR, (errmsg("extension needs to be updated"),
 						errhint("Run ALTER EXTENSION pg_incremental UPDATE")));
 	if (PG_ARGISNULL(0))
@@ -224,6 +236,8 @@ incremental_create_file_list_pipeline(PG_FUNCTION_ARGS)
 		if (m != -1 && m < 1)
 			ereport(ERROR, (errmsg("max_batches_per_run must be -1 (no limit) or a positive integer")));
 	}
+	if (!PG_ARGISNULL(9) && PG_GETARG_INT32(9) < 1)
+		ereport(ERROR, (errmsg("job_count must be a positive integer")));
 
 	char	   *pipelineName = text_to_cstring(PG_GETARG_TEXT_P(0));
 	char	   *prefix = text_to_cstring(PG_GETARG_TEXT_P(1));
@@ -234,6 +248,7 @@ incremental_create_file_list_pipeline(PG_FUNCTION_ARGS)
 	char	   *schedule = PG_ARGISNULL(6) ? NULL : text_to_cstring(PG_GETARG_TEXT_P(6));
 	bool		executeImmediately = PG_ARGISNULL(7) ? false : PG_GETARG_BOOL(7);
 	int			maxBatchesPerRun = PG_ARGISNULL(8) ? -1 : PG_GETARG_INT32(8);
+	int			jobCount = PG_ARGISNULL(9) ? 1 : PG_GETARG_INT32(9);
 	char	   *searchPath = pstrdup(namespace_search_path);
 
 	if (listFunction == NULL)
@@ -268,22 +283,27 @@ incremental_create_file_list_pipeline(PG_FUNCTION_ARGS)
 
 	InsertPipeline(pipelineName, FILE_LIST_PIPELINE, InvalidOid, command, searchPath);
 	InitializeFileListPipelineState(pipelineName, prefix, batched, listFunction, maxBatchSize,
-									maxBatchesPerRun);
+									maxBatchesPerRun, jobCount);
 
-	if (executeImmediately)
-		ExecutePipeline(pipelineName, FILE_LIST_PIPELINE, command, searchPath);
+	/*
+	 * With multiple jobs, existing files are left to the jobs, since
+	 * executing here would process them serially.
+	 */
+	if (executeImmediately && jobCount > 1 && schedule == NULL)
+		ereport(NOTICE, (errmsg("pipeline %s: not executing immediately, files are "
+								"processed by %d parallel jobs", pipelineName, jobCount),
+						 errhint("Without a schedule, call incremental.execute_pipeline(%s, job_index) "
+								 "for each job index from 0 to %d.",
+								 quote_literal_cstr(pipelineName), jobCount - 1)));
+	else if (executeImmediately && jobCount > 1)
+		ereport(NOTICE, (errmsg("pipeline %s: not executing immediately, files are "
+								"processed by %d parallel jobs", pipelineName, jobCount)));
+	else if (executeImmediately)
+		ExecutePipeline(pipelineName, FILE_LIST_PIPELINE, command, searchPath,
+						ALL_JOBS);
 
 	if (schedule != NULL)
-	{
-		char	   *jobName = GetCronJobNameForPipeline(pipelineName);
-		char	   *cronCommand = GetCronCommandForPipeline(pipelineName);
-
-		int64		jobId = ScheduleCronJob(jobName, schedule, cronCommand);
-
-		ereport(NOTICE, (errmsg("pipeline %s: scheduled cron job with ID " INT64_FORMAT
-								" and schedule %s",
-								pipelineName, jobId, schedule)));
-	}
+		ScheduleFileListPipelineJobs(pipelineName, schedule, jobCount);
 
 	PG_RETURN_VOID();
 }
@@ -318,7 +338,81 @@ incremental_execute_pipeline(PG_FUNCTION_ARGS)
 
 	EnsurePipelineOwner(pipelineName, pipelineDesc->ownerId);
 	ExecutePipeline(pipelineName, pipelineDesc->pipelineType, pipelineDesc->command,
-					pipelineDesc->searchPath);
+					pipelineDesc->searchPath, ALL_JOBS);
+
+	PG_RETURN_VOID();
+}
+
+
+/*
+ * incremental_execute_pipeline_job executes a single job of a file list
+ * pipeline. Different jobs of the same pipeline can run concurrently.
+ */
+Datum
+incremental_execute_pipeline_job(PG_FUNCTION_ARGS)
+{
+	if (PG_ARGISNULL(0))
+		ereport(ERROR, (errmsg("pipeline_name cannot be NULL")));
+	if (PG_ARGISNULL(1))
+		ereport(ERROR, (errmsg("job_index cannot be NULL")));
+	if (PG_GETARG_INT32(1) < 0)
+		ereport(ERROR, (errmsg("job_index cannot be negative")));
+
+	char	   *pipelineName = text_to_cstring(PG_GETARG_TEXT_P(0));
+	int			jobIndex = PG_GETARG_INT32(1);
+	PipelineDesc *pipelineDesc = ReadPipelineDesc(pipelineName);
+
+	EnsurePipelineOwner(pipelineName, pipelineDesc->ownerId);
+
+	if (pipelineDesc->pipelineType != FILE_LIST_PIPELINE)
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("pipeline \"%s\" is not a file list pipeline", pipelineName),
+						errdetail("Only file list pipelines can have multiple jobs.")));
+
+	ExecutePipeline(pipelineName, pipelineDesc->pipelineType, pipelineDesc->command,
+					pipelineDesc->searchPath, jobIndex);
+
+	PG_RETURN_VOID();
+}
+
+
+/*
+ * incremental_alter_file_list_pipeline changes the number of parallel jobs of
+ * a file list pipeline. The cron jobs are replaced by jobs with the same
+ * schedule as the current ones.
+ */
+Datum
+incremental_alter_file_list_pipeline(PG_FUNCTION_ARGS)
+{
+	if (PG_ARGISNULL(0))
+		ereport(ERROR, (errmsg("pipeline_name cannot be NULL")));
+	if (PG_ARGISNULL(1) || PG_GETARG_INT32(1) < 1)
+		ereport(ERROR, (errmsg("job_count must be a positive integer")));
+
+	char	   *pipelineName = text_to_cstring(PG_GETARG_TEXT_P(0));
+	int			jobCount = PG_GETARG_INT32(1);
+	PipelineDesc *pipelineDesc = ReadPipelineDesc(pipelineName);
+
+	EnsurePipelineOwner(pipelineName, pipelineDesc->ownerId);
+
+	if (pipelineDesc->pipelineType != FILE_LIST_PIPELINE)
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("pipeline \"%s\" is not a file list pipeline", pipelineName),
+						errdetail("Only file list pipelines can have multiple jobs.")));
+
+	/* waits for running executions of the pipeline */
+	int			oldJobCount = SetFileListPipelineJobCount(pipelineName, jobCount);
+
+	if (oldJobCount == jobCount)
+		PG_RETURN_VOID();
+
+	char	   *schedule = GetFileListPipelineSchedule(pipelineName, oldJobCount);
+
+	/* also removes jobs left over when only some of them were unscheduled */
+	UnscheduleFileListPipelineJobs(pipelineName, oldJobCount);
+
+	if (schedule != NULL)
+		ScheduleFileListPipelineJobs(pipelineName, schedule, jobCount);
 
 	PG_RETURN_VOID();
 }
@@ -335,11 +429,22 @@ incremental_reset_pipeline(PG_FUNCTION_ARGS)
 	bool		executeImmediately = PG_ARGISNULL(1) ? false : PG_GETARG_BOOL(1);
 
 	EnsurePipelineOwner(pipelineName, pipelineDesc->ownerId);
+
+	int			jobCount = 1;
+
+	/* also waits for running executions of the pipeline */
+	if (pipelineDesc->pipelineType == FILE_LIST_PIPELINE)
+		jobCount = GetFileListPipelineJobCount(pipelineName);
+
 	ResetPipeline(pipelineName, pipelineDesc->pipelineType);
 
-	if (executeImmediately)
+	/* with multiple jobs, reprocessing is left to the jobs, as in create */
+	if (executeImmediately && jobCount > 1)
+		ereport(NOTICE, (errmsg("pipeline %s: not executing immediately, files are "
+								"processed by %d parallel jobs", pipelineName, jobCount)));
+	else if (executeImmediately)
 		ExecutePipeline(pipelineName, pipelineDesc->pipelineType, pipelineDesc->command,
-						pipelineDesc->searchPath);
+						pipelineDesc->searchPath, ALL_JOBS);
 
 	PG_RETURN_VOID();
 }
@@ -355,9 +460,15 @@ incremental_drop_pipeline(PG_FUNCTION_ARGS)
 	PipelineDesc *pipelineDesc = ReadPipelineDesc(pipelineName);
 
 	EnsurePipelineOwner(pipelineName, pipelineDesc->ownerId);
+
+	int			jobCount = 1;
+
+	if (pipelineDesc->pipelineType == FILE_LIST_PIPELINE)
+		jobCount = GetFileListPipelineJobCount(pipelineName);
+
 	DeletePipeline(pipelineName);
 
-	UnscheduleCronJob(GetCronJobNameForPipeline(pipelineName));
+	UnscheduleFileListPipelineJobs(pipelineName, jobCount);
 
 	PG_RETURN_VOID();
 }
@@ -370,6 +481,13 @@ static void
 InsertPipeline(char *pipelineName, PipelineType pipelineType, Oid sourceRelationId,
 			   char *command, char *searchPath)
 {
+	if (IsCronJobNameForPipelineJob(pipelineName))
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("pipeline name \"%s\" cannot end in :job:<number>",
+							   pipelineName),
+						errdetail("The name would clash with the cron job of a parallel "
+								  "file list pipeline job.")));
+
 	Oid			savedUserId = InvalidOid;
 	int			savedSecurityContext = 0;
 
@@ -516,7 +634,7 @@ EnsurePipelineOwner(char *pipelineName, Oid ownerId)
  */
 static void
 ExecutePipeline(char *pipelineName, PipelineType pipelineType,
-				char *command, char *searchPath)
+				char *command, char *searchPath, int jobIndex)
 {
 	int			gucNestLevel = NewGUCNestLevel();
 
@@ -538,7 +656,7 @@ ExecutePipeline(char *pipelineName, PipelineType pipelineType,
 			break;
 
 		case FILE_LIST_PIPELINE:
-			ExecuteFileListPipeline(pipelineName, command);
+			ExecuteFileListPipeline(pipelineName, command, jobIndex);
 			break;
 
 		default:
@@ -638,4 +756,153 @@ GetCronCommandForPipeline(char *pipelineName)
 {
 	return psprintf("call incremental.execute_pipeline(%s)",
 					quote_literal_cstr(pipelineName));
+}
+
+
+/*
+ * GetCronJobNameForPipelineJob returns the name of the cron job to use for
+ * a given job of a file list pipeline.
+ */
+static char *
+GetCronJobNameForPipelineJob(char *pipelineName, int jobIndex)
+{
+	return psprintf("pipeline:%s:job:%d", pipelineName, jobIndex);
+}
+
+
+/*
+ * IsCronJobNameForPipelineJob returns whether a pipeline name ends in
+ * :job:<number>, such that its cron job name would be the same as that of a
+ * job of another pipeline.
+ */
+static bool
+IsCronJobNameForPipelineJob(char *pipelineName)
+{
+	char	   *suffix = NULL;
+
+	for (char *match = strstr(pipelineName, ":job:"); match != NULL;
+		 match = strstr(match + 1, ":job:"))
+		suffix = match + strlen(":job:");
+
+	if (suffix == NULL || *suffix == '\0')
+		return false;
+
+	for (char *digit = suffix; *digit != '\0'; digit++)
+		if (!isdigit((unsigned char) *digit))
+			return false;
+
+	return true;
+}
+
+
+/*
+ * GetCronCommandForPipelineJob returns the command of the cron job to use
+ * for a given job of a file list pipeline.
+ */
+static char *
+GetCronCommandForPipelineJob(char *pipelineName, int jobIndex)
+{
+	return psprintf("call incremental.execute_pipeline(%s, %d)",
+					quote_literal_cstr(pipelineName), jobIndex);
+}
+
+
+/*
+ * ScheduleFileListPipelineJobs schedules the cron jobs of a file list
+ * pipeline, one per job index when there are multiple jobs.
+ */
+static void
+ScheduleFileListPipelineJobs(char *pipelineName, char *schedule, int jobCount)
+{
+	if (jobCount == 1)
+	{
+		int64		jobId = ScheduleFileListPipelineJob(GetCronJobNameForPipeline(pipelineName),
+													 GetCronCommandForPipeline(pipelineName),
+													 schedule);
+
+		ereport(NOTICE, (errmsg("pipeline %s: scheduled cron job with ID " INT64_FORMAT
+								" and schedule %s",
+								pipelineName, jobId, schedule)));
+		return;
+	}
+
+	const char *maxRunningJobs = GetConfigOption("cron.max_running_jobs", true, false);
+
+	if (maxRunningJobs != NULL && jobCount > atoi(maxRunningJobs))
+		ereport(WARNING, (errmsg("pipeline %s: job_count %d exceeds cron.max_running_jobs (%s)",
+							  pipelineName, jobCount, maxRunningJobs),
+						  errdetail("Not all jobs can run at the same time.")));
+
+	/* schedule a cron job per job index, such that jobs run in parallel */
+	for (int jobIndex = 0; jobIndex < jobCount; jobIndex++)
+	{
+		int64		jobId = ScheduleFileListPipelineJob(GetCronJobNameForPipelineJob(pipelineName, jobIndex),
+													 GetCronCommandForPipelineJob(pipelineName, jobIndex),
+													 schedule);
+
+		ereport(NOTICE, (errmsg("pipeline %s: scheduled cron job with ID " INT64_FORMAT
+								" for job index %d and schedule %s",
+								pipelineName, jobId, jobIndex, schedule)));
+	}
+}
+
+
+/*
+ * ScheduleFileListPipelineJob schedules a single cron job, unless a job with
+ * the same name runs a different command, which would be replaced.
+ */
+static int64
+ScheduleFileListPipelineJob(char *jobName, char *command, char *schedule)
+{
+	char	   *existingCommand = GetCronJobCommand(jobName);
+
+	if (existingCommand != NULL && strcmp(existingCommand, command) != 0)
+		ereport(ERROR, (errcode(ERRCODE_DUPLICATE_OBJECT),
+						errmsg("cron job \"%s\" already exists", jobName),
+						errdetail("The job runs: %s", existingCommand)));
+
+	return ScheduleCronJob(jobName, schedule, command);
+}
+
+
+/*
+ * GetFileListPipelineSchedule returns the schedule of the first cron job of a
+ * file list pipeline that still exists, or NULL if it is not scheduled.
+ */
+static char *
+GetFileListPipelineSchedule(char *pipelineName, int jobCount)
+{
+	if (jobCount == 1)
+		return GetCronJobSchedule(GetCronJobNameForPipeline(pipelineName),
+								  GetCronCommandForPipeline(pipelineName));
+
+	for (int jobIndex = 0; jobIndex < jobCount; jobIndex++)
+	{
+		char	   *schedule =
+			GetCronJobSchedule(GetCronJobNameForPipelineJob(pipelineName, jobIndex),
+							   GetCronCommandForPipelineJob(pipelineName, jobIndex));
+
+		if (schedule != NULL)
+			return schedule;
+	}
+
+	return NULL;
+}
+
+
+/*
+ * UnscheduleFileListPipelineJobs unschedules the cron jobs of a file list
+ * pipeline.
+ */
+static void
+UnscheduleFileListPipelineJobs(char *pipelineName, int jobCount)
+{
+	if (jobCount == 1)
+	{
+		UnscheduleCronJob(GetCronJobNameForPipeline(pipelineName));
+		return;
+	}
+
+	for (int jobIndex = 0; jobIndex < jobCount; jobIndex++)
+		UnscheduleCronJob(GetCronJobNameForPipelineJob(pipelineName, jobIndex));
 }

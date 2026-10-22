@@ -70,11 +70,125 @@ ScheduleCronJob(char *jobName, char *schedule, char *command)
 
 
 /*
+ * GetCronJobSchedule returns the schedule of the pg_cron job with the given
+ * name and command, or NULL if pg_cron is not installed or there is no such
+ * job. Matching the command skips same-named jobs of other users.
+ */
+char *
+GetCronJobSchedule(char *jobName, char *command)
+{
+	bool		missingOk = true;
+
+	if (get_extension_oid("pg_cron", missingOk) == InvalidOid)
+		return NULL;
+
+	MemoryContext outerContext = CurrentMemoryContext;
+
+	char	   *query =
+		"SELECT schedule FROM cron.job WHERE jobname = $1 AND command = $2";
+
+	bool		readOnly = true;
+	int			tupleCount = 1;
+	int			argCount = 2;
+	Oid			argTypes[] = {TEXTOID, TEXTOID};
+	Datum		argValues[] = {
+		CStringGetTextDatum(jobName),
+		CStringGetTextDatum(command)
+	};
+	char		argNulls[] = {' ', ' '};
+
+	SPI_connect();
+	SPI_execute_with_args(query,
+						  argCount,
+						  argTypes,
+						  argValues,
+						  argNulls,
+						  readOnly,
+						  tupleCount);
+
+	char	   *schedule = NULL;
+
+	if (SPI_processed > 0)
+	{
+		bool		isNull = false;
+		Datum		scheduleDatum = SPI_getbinval(SPI_tuptable->vals[0],
+												  SPI_tuptable->tupdesc, 1, &isNull);
+
+		if (!isNull)
+			schedule = MemoryContextStrdup(outerContext, TextDatumGetCString(scheduleDatum));
+	}
+
+	SPI_finish();
+
+	return schedule;
+}
+
+
+/*
+ * GetCronJobCommand returns the command of the pg_cron job with the given
+ * name, or NULL if pg_cron is not installed or there is no such job.
+ */
+char *
+GetCronJobCommand(char *jobName)
+{
+	bool		missingOk = true;
+
+	if (get_extension_oid("pg_cron", missingOk) == InvalidOid)
+		return NULL;
+
+	MemoryContext outerContext = CurrentMemoryContext;
+
+	char	   *query =
+		"SELECT command FROM cron.job WHERE jobname = $1";
+
+	bool		readOnly = true;
+	int			tupleCount = 1;
+	int			argCount = 1;
+	Oid			argTypes[] = {TEXTOID};
+	Datum		argValues[] = {
+		CStringGetTextDatum(jobName)
+	};
+	char		argNulls[] = {' '};
+
+	SPI_connect();
+	SPI_execute_with_args(query,
+						  argCount,
+						  argTypes,
+						  argValues,
+						  argNulls,
+						  readOnly,
+						  tupleCount);
+
+	char	   *command = NULL;
+
+	if (SPI_processed > 0)
+	{
+		bool		isNull = false;
+		Datum		commandDatum = SPI_getbinval(SPI_tuptable->vals[0],
+											 SPI_tuptable->tupdesc, 1, &isNull);
+
+		if (!isNull)
+			command = MemoryContextStrdup(outerContext, TextDatumGetCString(commandDatum));
+	}
+
+	SPI_finish();
+
+	return command;
+}
+
+
+/*
  * UnscheduleCronJob unschedules a pg_cron job.
  */
 void
 UnscheduleCronJob(char *jobName)
 {
+	bool		missingOk = true;
+
+	/* nothing to unschedule if pg_cron is not installed */
+	if (get_extension_oid("pg_cron", missingOk) == InvalidOid)
+		return;
+
 	char	   *query =
 		"SELECT cron.unschedule(jobid) from cron.job where jobname = $1";
 
