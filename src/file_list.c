@@ -62,6 +62,11 @@ InitializeFileListPipelineState(char *pipelineName, char *pattern, bool batched,
 								char *listFunction, int maxBatchSize,
 								int maxBatchesPerRun, int jobCount)
 {
+	if (!FileListPipelinesHasColumn("job_count"))
+		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						errmsg("extension needs to be updated to create file list pipelines"),
+						errhint("Run ALTER EXTENSION pg_incremental UPDATE")));
+
 	Oid			savedUserId = InvalidOid;
 	int			savedSecurityContext = 0;
 
