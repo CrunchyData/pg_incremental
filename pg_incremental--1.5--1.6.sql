@@ -37,3 +37,26 @@ CREATE FUNCTION incremental.alter_file_list_pipeline(
 AS 'MODULE_PATHNAME', $function$incremental_alter_file_list_pipeline$function$;
 COMMENT ON FUNCTION incremental.alter_file_list_pipeline(text,int)
  IS 'change the number of parallel jobs of a file list pipeline';
+
+-- _drop_trigger is SECURITY DEFINER, so pg_temp must come last in its
+-- search_path and the objects it uses are schema-qualified, to prevent
+-- temporary objects from shadowing them.
+CREATE OR REPLACE FUNCTION incremental._drop_trigger()
+ RETURNS event_trigger
+ LANGUAGE plpgsql
+ SET search_path = pg_catalog, pg_temp
+ SECURITY DEFINER
+ AS $function$
+DECLARE
+  v_obj pg_catalog.record;
+BEGIN
+  FOR v_obj IN
+    SELECT * FROM pg_catalog.pg_event_trigger_dropped_objects()
+    WHERE object_type IN ('table', 'foreign table', 'sequence')
+  LOOP
+    PERFORM incremental.drop_pipeline(pipeline_name)
+    FROM incremental.pipelines
+    WHERE source_relation = v_obj.objid;
+  END LOOP;
+END;
+$function$;
