@@ -6,6 +6,8 @@
 * `incremental.drop_pipeline` no longer fails when pg\_cron is not installed.
 * Pipeline names ending in `:job:<number>` are no longer allowed, and scheduling fails instead of replacing an existing pg\_cron job with the same name and a different command.
 * Existing file list pipelines keep working with the new library before `ALTER EXTENSION pg_incremental UPDATE` has run on a 1.4 schema (v1.5.0 failed with `column "max_batches_per_run" does not exist`).
+* Security: `incremental._drop_trigger`, the `SECURITY DEFINER` event trigger function that drops pipelines when their source table is dropped, now sets `search_path = pg_catalog, pg_temp` and schema-qualifies the objects it references. Previously, an unprivileged user could create objects in `pg_temp` (such as a type named `record`) that the function would pick up and run with the privileges of the extension owner.
+* `ALTER EXTENSION pg_incremental UPDATE` recreates `incremental._drop_trigger` with these settings, so existing installations are fixed by upgrading to 1.6.
 
 ### pg\_incremental v1.5.0
 
