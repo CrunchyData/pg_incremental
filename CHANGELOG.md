@@ -8,6 +8,8 @@
 * Existing file list pipelines keep working with the new library before `ALTER EXTENSION pg_incremental UPDATE` has run on a 1.4 schema (v1.5.0 failed with `column "max_batches_per_run" does not exist`).
 * Security: `incremental._drop_trigger`, the `SECURITY DEFINER` event trigger function that drops pipelines when their source table is dropped, now sets `search_path = pg_catalog, pg_temp` and schema-qualifies the objects it references. Previously, an unprivileged user could create objects in `pg_temp` (such as a type named `record`) that the function would pick up and run with the privileges of the extension owner.
 * `ALTER EXTENSION pg_incremental UPDATE` recreates `incremental._drop_trigger` with these settings, so existing installations are fixed by upgrading to 1.6.
+* Security: the list function of a file list pipeline now runs as the user executing the pipeline. Previously, it was called with superuser privileges, so any user that could create a function could become superuser by creating a file list pipeline with that function as its `list_function`.
+* Security: sequence pipelines now require `SELECT` or `USAGE` on the sequence when the pipeline is created and executed, and read the last sequence value as the current user. Previously, any user could create a sequence pipeline to read the last value of a sequence they do not have access to.
 
 ### pg\_incremental v1.5.0
 
