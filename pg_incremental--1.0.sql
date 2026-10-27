@@ -124,14 +124,14 @@ COMMENT ON FUNCTION incremental.drop_pipeline(text)
 CREATE FUNCTION incremental._drop_trigger()
  RETURNS event_trigger
  LANGUAGE plpgsql
- SET search_path = pg_catalog
+ SET search_path = pg_catalog, pg_temp
  SECURITY DEFINER
  AS $function$
 DECLARE
-  v_obj record;
+  v_obj pg_catalog.record;
 BEGIN
   FOR v_obj IN
-    SELECT * FROM pg_event_trigger_dropped_objects()
+    SELECT * FROM pg_catalog.pg_event_trigger_dropped_objects()
     WHERE object_type IN ('table', 'foreign table', 'sequence')
   LOOP
     PERFORM incremental.drop_pipeline(pipeline_name)
