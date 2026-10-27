@@ -14,6 +14,7 @@
 #include "executor/spi.h"
 #include "tcop/tcopprot.h"
 #include "tcop/utility.h"
+#include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
@@ -114,6 +115,15 @@ incremental_create_sequence_pipeline(PG_FUNCTION_ARGS)
 								errmsg("%s is not a table or sequence", get_rel_name(sequenceId))));
 			}
 	}
+
+	/*
+	 * The pipeline reads the sequence, so the user needs to be allowed to
+	 * read it.
+	 */
+	if (pg_class_aclcheck(sequenceId, GetUserId(), ACL_SELECT | ACL_USAGE) != ACLCHECK_OK)
+		ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+						errmsg("permission denied for sequence %s",
+							   get_rel_name(sequenceId))));
 
 	List	   *paramTypes = list_make2_oid(INT8OID, INT8OID);
 

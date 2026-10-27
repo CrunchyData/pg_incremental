@@ -5,7 +5,7 @@ MODULE_big = $(EXTENSION)
 DATA = $(wildcard $(EXTENSION)--*--*.sql) $(EXTENSION)--1.0.sql
 SOURCES := $(wildcard src/*.c) $(wildcard src/*/*.c)
 OBJS := $(patsubst %.c,%.o,$(sort $(SOURCES)))
-REGRESS = sequence time_interval file_list upgrade
+REGRESS = sequence time_interval file_list security upgrade
 
 PG_CPPFLAGS = -Iinclude
 PG_CONFIG ?= pg_config

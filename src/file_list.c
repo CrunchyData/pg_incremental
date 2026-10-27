@@ -481,69 +481,114 @@ static List *
 GetUnprocessedFileList(char *pipelineName, char *listFunction, char *filePattern,
 					   int jobCount, int jobIndex)
 {
-	List	   *fileList = NIL;
+	List     *fileList = NIL;
 	MemoryContext outerContext = CurrentMemoryContext;
 
-	Oid			savedUserId = InvalidOid;
-	int			savedSecurityContext = 0;
-
 	/*
-	 * Switch to superuser in case the current user does not have write
-	 * privileges for the pipelines table.
+	 * Call the list function as the current user. The list function is
+	 * user-supplied, so it must never run with superuser privileges.
 	 */
-	GetUserIdAndSecContext(&savedUserId, &savedSecurityContext);
-	SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, SECURITY_LOCAL_USERID_CHANGE);
+	StringInfo  listQuery = makeStringInfo();
 
-	/*
-	 * Get the unprocessed files.
-	 */
-	StringInfo	query = makeStringInfo();
-
-	appendStringInfo(query,
-					 "select list.path "
-					 "from %s($2) as list(path) "
-					 "left join incremental.processed_files proc "
-					 "on (pipeline_name operator(pg_catalog.=) $1 "
-					 "and list.path operator(pg_catalog.=) proc.path) "
-					 "where proc.path is null",
+	appendStringInfo(listQuery,
+					 "select pg_catalog.array_agg(list.path) "
+					 "from %s($1) as list(path)",
 					 listFunction);
 
 	if (jobIndex != ALL_JOBS)
-		appendStringInfoString(query,
-							   " and pg_catalog.abs(pg_catalog.hashtextextended(list.path, 0) "
-							   "operator(pg_catalog.%) $3) operator(pg_catalog.=) $4");
+		appendStringInfoString(listQuery,
+								 " where pg_catalog.abs(pg_catalog.hashtextextended(list.path, 0) "
+								 "operator(pg_catalog.%) $2) operator(pg_catalog.=) $3");
 
-	bool		readOnly = false;
-	int			tupleCount = 0;
-	int			argCount = jobIndex != ALL_JOBS ? 4 : 2;
-	Oid			argTypes[] = {TEXTOID, TEXTOID, INT8OID, INT8OID};
-	Datum		argValues[] = {
-		CStringGetTextDatum(pipelineName),
+	bool    readOnly = false;
+	int      tupleCount = 0;
+	int      listArgCount = jobIndex != ALL_JOBS ? 3 : 1;
+	Oid      listArgTypes[] = {TEXTOID, INT8OID, INT8OID};
+	Datum    listArgValues[] = {
 		CStringGetTextDatum(filePattern),
 		Int64GetDatum(jobCount),
 		Int64GetDatum(jobIndex)
 	};
-	char		argNulls[] = {' ', ' ', ' ', ' '};
+	char    listArgNulls[] = {' ', ' ', ' '};
 
 	SPI_connect();
-	SPI_execute_with_args(query->data,
-						  argCount,
-						  argTypes,
-						  argValues,
-						  argNulls,
-						  readOnly,
-						  tupleCount);
+	SPI_execute_with_args(listQuery->data,
+							listArgCount,
+							listArgTypes,
+							listArgValues,
+							listArgNulls,
+							readOnly,
+							tupleCount);
 
-	TupleDesc	rowDesc = SPI_tuptable->tupdesc;
+	bool    pathsIsNull = true;
+	Datum    pathsDatum = (Datum) 0;
+
+	if (SPI_processed > 0)
+		pathsDatum = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1,
+									 &pathsIsNull);
+
+	if (pathsIsNull)
+	{
+		SPI_finish();
+		return NIL;
+	}
+
+	/* copy the paths out of the SPI memory context */
+	MemoryContext oldContext = MemoryContextSwitchTo(outerContext);
+
+	pathsDatum = PointerGetDatum(DatumGetArrayTypePCopy(pathsDatum));
+
+	MemoryContextSwitchTo(oldContext);
+
+	SPI_finish();
+
+	Oid      savedUserId = InvalidOid;
+	int      savedSecurityContext = 0;
+
+	/*
+	 * Switch to superuser in case the current user does not have read
+	 * privileges for the processed files table. This query only uses
+	 * extension and catalog objects.
+	 */
+	GetUserIdAndSecContext(&savedUserId, &savedSecurityContext);
+	SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, SECURITY_LOCAL_USERID_CHANGE);
+
+	char     *query =
+		"select list.path "
+		"from pg_catalog.unnest($2) with ordinality as list(path, ord) "
+		"left join incremental.processed_files proc "
+		"on (pipeline_name operator(pg_catalog.=) $1 "
+		"and list.path operator(pg_catalog.=) proc.path) "
+		"where proc.path is null and list.path is not null "
+		"order by list.ord";
+
+	int      argCount = 2;
+	Oid      argTypes[] = {TEXTOID, TEXTARRAYOID};
+	Datum    argValues[] = {
+		CStringGetTextDatum(pipelineName),
+		pathsDatum
+	};
+	char    argNulls[] = {' ', ' '};
+
+	SPI_connect();
+	SPI_execute_with_args(query,
+							argCount,
+							argTypes,
+							argValues,
+							argNulls,
+							readOnly,
+							tupleCount);
+
+	TupleDesc  rowDesc = SPI_tuptable->tupdesc;
 
 	for (int rowIndex = 0; rowIndex < SPI_processed; rowIndex++)
 	{
-		HeapTuple	row = SPI_tuptable->vals[rowIndex];
+		HeapTuple  row = SPI_tuptable->vals[rowIndex];
 
-		bool		isNull = false;
-		Datum		pathDatum = SPI_getbinval(row, rowDesc, 1, &isNull);
+		bool    isNull = false;
+		Datum    pathDatum = SPI_getbinval(row, rowDesc, 1, &isNull);
 
-		MemoryContext oldContext = MemoryContextSwitchTo(outerContext);
+		oldContext = MemoryContextSwitchTo(outerContext);
 
 		fileList = lappend(fileList, TextDatumGetCString(pathDatum));
 

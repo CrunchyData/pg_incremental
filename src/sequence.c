@@ -195,7 +195,7 @@ GetSequenceNumberRange(char *pipelineName)
 	char	   *query =
 		"select"
 		" last_processed_sequence_number + 1,"
-		" pg_catalog.pg_sequence_last_value(sequence_name) seq,"
+		" sequence_name,"
 		" max_batch_size "
 		"from incremental.sequence_pipelines "
 		"where pipeline_name operator(pg_catalog.=) $1 "
@@ -234,36 +234,62 @@ GetSequenceNumberRange(char *pipelineName)
 	if (!rangeStartIsNull)
 		range->rangeStart = DatumGetInt64(rangeStartDatum);
 
-	/* read pg_sequence_last_value result */
-	bool		rangeEndIsNull = false;
-	Datum		rangeEndDatum = SPI_getbinval(row, rowDesc, 2, &rangeEndIsNull);
+	/* read sequence_name, which is read below as the current user */
+	bool    sequenceIdIsNull = false;
+	Datum    sequenceIdDatum = SPI_getbinval(row, rowDesc, 2, &sequenceIdIsNull);
 
-	if (!rangeEndIsNull)
-		range->rangeEnd = DatumGetInt64(rangeEndDatum);
-
-	/* read max_batch_size and apply limit if set */
-	bool		maxBatchSizeIsNull = false;
-	Datum		maxBatchSizeDatum = SPI_getbinval(row, rowDesc, 3, &maxBatchSizeIsNull);
-
-	if (!maxBatchSizeIsNull)
-	{
-		int64		maxBatchSize = DatumGetInt64(maxBatchSizeDatum);
-
-		if (maxBatchSize > 0 && range->rangeStart <= range->rangeEnd)
-		{
-			uint64		availableRange = range->rangeEnd - range->rangeStart + 1;
-
-			if (availableRange > maxBatchSize)
-			{
-				/* limit the range to max_batch_size */
-				range->rangeEnd = range->rangeStart + maxBatchSize - 1;
-			}
-		}
-	}
+	/* read max_batch_size */
+	bool    maxBatchSizeIsNull = false;
+	Datum    maxBatchSizeDatum = SPI_getbinval(row, rowDesc, 3, &maxBatchSizeIsNull);
+	int64    maxBatchSize = maxBatchSizeIsNull ? 0 : DatumGetInt64(maxBatchSizeDatum);
 
 	SPI_finish();
 
 	SetUserIdAndSecContext(savedUserId, savedSecurityContext);
+
+	/*
+	 * Get the last-drawn sequence number, which may be part of a write that
+	 * has not committed yet. This runs as the current user, such that users
+	 * cannot read the state of sequences they do not have access to.
+	 */
+	if (!sequenceIdIsNull)
+	{
+		Oid			sequenceId = DatumGetObjectId(sequenceIdDatum);
+
+		if (pg_class_aclcheck(sequenceId, GetUserId(), ACL_SELECT | ACL_USAGE) != ACLCHECK_OK)
+			ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+							errmsg("permission denied for sequence %s",
+								   get_rel_name(sequenceId))));
+
+		Oid			lastValueArgTypes[] = {OIDOID};
+		Datum    lastValueArgValues[] = {sequenceIdDatum};
+
+		SPI_connect();
+		SPI_execute_with_args("select pg_catalog.pg_sequence_last_value($1::pg_catalog.regclass)",
+								1, lastValueArgTypes, lastValueArgValues, " ",
+								readOnly, tupleCount);
+
+		bool    rangeEndIsNull = true;
+		Datum    rangeEndDatum = SPI_getbinval(SPI_tuptable->vals[0],
+												 SPI_tuptable->tupdesc, 1, &rangeEndIsNull);
+
+		if (!rangeEndIsNull)
+			range->rangeEnd = DatumGetInt64(rangeEndDatum);
+
+		SPI_finish();
+	}
+
+	/* apply max_batch_size limit if set */
+	if (maxBatchSize > 0 && range->rangeStart <= range->rangeEnd)
+	{
+		uint64    availableRange = range->rangeEnd - range->rangeStart + 1;
+
+		if (availableRange > maxBatchSize)
+		{
+			/* limit the range to max_batch_size */
+			range->rangeEnd = range->rangeStart + maxBatchSize - 1;
+		}
+	}
 
 	/* return whether there are rows to process */
 	return range;

@@ -1,0 +1,80 @@
+-- pipelines must not run user-supplied code with elevated privileges
+CREATE EXTENSION pg_incremental CASCADE;
+CREATE ROLE incremental_attacker;
+CREATE SCHEMA attacker_schema AUTHORIZATION incremental_attacker;
+CREATE TABLE secret_table (id bigserial primary key);
+INSERT INTO secret_table DEFAULT VALUES;
+SET ROLE incremental_attacker;
+-- a list function that tries to escalate privileges
+CREATE FUNCTION attacker_schema.evil_list(pattern text)
+RETURNS SETOF text LANGUAGE plpgsql AS $$
+BEGIN
+  ALTER ROLE incremental_attacker SUPERUSER;
+  RETURN NEXT 'file';
+END;
+$$;
+SELECT incremental.create_file_list_pipeline('evil-files', 'pattern', 'SELECT 1',
+  list_function := 'attacker_schema.evil_list', schedule := NULL,
+  execute_immediately := false);
+ create_file_list_pipeline 
+---------------------------
+ 
+(1 row)
+
+CALL incremental.execute_pipeline('evil-files');
+ERROR:  permission denied to alter role
+DETAIL:  Only roles with the SUPERUSER attribute may change the SUPERUSER attribute.
+CONTEXT:  SQL statement "ALTER ROLE incremental_attacker SUPERUSER"
+PL/pgSQL function attacker_schema.evil_list(text) line 3 at SQL statement
+SQL statement "select pg_catalog.array_agg(list.path) from attacker_schema.evil_list($1) as list(path)"
+-- cannot read the state of a sequence without privileges on it
+SELECT incremental.create_sequence_pipeline('evil-sequence', 'secret_table', 'SELECT 1',
+  schedule := NULL);
+ERROR:  permission denied for sequence secret_table_id_seq
+RESET ROLE;
+SELECT rolsuper FROM pg_roles WHERE rolname = 'incremental_attacker';
+ rolsuper 
+----------
+ f
+(1 row)
+
+-- permission can be revoked after the pipeline is created
+CREATE TABLE shared_table (id bigserial primary key);
+GRANT SELECT ON SEQUENCE shared_table_id_seq TO incremental_attacker;
+SET ROLE incremental_attacker;
+SELECT incremental.create_sequence_pipeline('revoked-sequence', 'shared_table', 'SELECT 1',
+  schedule := NULL);
+NOTICE:  pipeline revoked-sequence: processing sequence values from 0 to 0
+ create_sequence_pipeline 
+--------------------------
+ 
+(1 row)
+
+RESET ROLE;
+REVOKE SELECT ON SEQUENCE shared_table_id_seq FROM incremental_attacker;
+INSERT INTO shared_table DEFAULT VALUES;
+SET ROLE incremental_attacker;
+CALL incremental.execute_pipeline('revoked-sequence');
+ERROR:  permission denied for sequence shared_table_id_seq
+SELECT incremental.drop_pipeline('evil-files');
+ drop_pipeline 
+---------------
+ 
+(1 row)
+
+SELECT incremental.drop_pipeline('revoked-sequence');
+ drop_pipeline 
+---------------
+ 
+(1 row)
+
+RESET ROLE;
+DROP TABLE shared_table;
+DROP TABLE secret_table;
+DROP SCHEMA attacker_schema CASCADE;
+NOTICE:  drop cascades to function attacker_schema.evil_list(text)
+DROP ROLE incremental_attacker;
+DROP EXTENSION pg_incremental;
+NOTICE:  drop cascades to 2 other objects
+DETAIL:  drop cascades to function incremental._drop_extension_trigger()
+drop cascades to event trigger incremental_drop_extension_trigger
